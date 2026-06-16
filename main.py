@@ -1600,6 +1600,58 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
                 })
         saved.append(f"{today}_scorecard.csv")
 
+    if stock_list:
+        path = os.path.join(out, f"{today}_ticker_detail.csv")
+
+        fieldnames = [
+            "symbol", "name", "fiscal_year",
+            # Per-year series (everything in the charts)
+            "price", "eps", "pe", "historical_peg",
+            "roe", "bvps", "debt_assets_pct",
+            "ocfps", "fcfps", "revps", "divps",
+            # Current / analyst data (repeated per row for easy filtering)
+            "current_price", "trailing_pe", "forward_pe", "peg_ratio",
+            "analyst_tp", "analyst_low", "analyst_high", "consensus",
+        ]
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for d in stock_list:
+                hist_peg = compute_historical_peg(d["pe"], d["eps"])
+
+                for i, yr in enumerate(d["years"]):
+                    da = d["debt_assets"][i]
+                    da_pct = round(da * 100, 2) if da is not None else None
+
+                    writer.writerow({
+                        "symbol": d["symbol"],
+                        "name": d["name"],
+                        "fiscal_year": yr,
+                        "price": d["prices"][i],
+                        "eps": d["eps"][i],
+                        "pe": d["pe"][i],
+                        "historical_peg": hist_peg[i],
+                        "roe": d["roe"][i],
+                        "bvps": d["bvps"][i],
+                        "debt_assets_pct": da_pct,
+                        "ocfps": d["ocfps"][i],
+                        "fcfps": d["fcfps"][i],
+                        "revps": d["revps"][i],
+                        "divps": d["divps"][i],
+                        "current_price": d.get("current_price"),
+                        "trailing_pe": d.get("trailing_pe"),
+                        "forward_pe": d.get("forward_pe"),
+                        "peg_ratio": d.get("peg_ratio"),
+                        "analyst_tp": d.get("analyst_tp"),
+                        "analyst_low": d.get("analyst_low"),
+                        "analyst_high": d.get("analyst_high"),
+                        "consensus": d.get("consensus"),
+                    })
+
+        saved.append(f"{today}_ticker_detail.csv")
+
     if etf_list:
         path = os.path.join(out, f"{today}_etf_summary.csv")
         periods = sorted(set([1, 3, 5, 10, years_back - 1]))
@@ -1845,12 +1897,19 @@ def main():
     print(f"{'='*60}\n")
 
     # Pick tickers — creates the Tk window, returns after Go is pressed
-    _run_state = {"selected": [], "years_back": 11, "force_refresh": False, "do_export": False}
+    _run_state = {
+        "selected":      [],
+        "years_back":    11,
+        "force_refresh": False,
+        "do_export":     False,
+        "show_charts":   True,
+    }
 
     selected, YEARS_BACK, force_refresh, do_export, \
         _root, _log, _title_var, _run_again_btn, _status_bottom, _exit_btn, _user_exited = pick_tickers(
             DB_PATH, _run_state, prefs_callback=open_chart_prefs_dialog
         )
+    do_show = _run_state.get("show_charts", True)
 
     if not selected:
         print("No tickers selected. Exiting.")
@@ -1945,8 +2004,11 @@ def main():
         all_loaded = [d['symbol'] for d in stock_list] + [d['symbol'] for d in etf_list]
         log(f"\nLoaded: {', '.join(all_loaded)}", title="Building charts\u2026")
 
+        do_show       = _run_state.get("show_charts", True)
+        need_charts   = do_show or do_export
+
         apply_style()
-        chart_prefs = load_chart_prefs()
+        chart_prefs       = load_chart_prefs()
         figs_stock_single = []
         fig_stock_table   = None
         fig_comparison    = None
@@ -1954,39 +2016,36 @@ def main():
         fig_etf           = None
         fig_etf_table     = None
 
-        for d, col in zip(stock_list, stock_colors):
-            log(f"  Chart: {d['symbol']}")
-            fig = plot_single_ticker(d, col, prefs=chart_prefs)
-            fig.canvas.manager.set_window_title(f"{d['symbol']} \u2014 {d['name']}")
-            figs_stock_single.append(fig)
+        if need_charts:
+            for d, col in zip(stock_list, stock_colors):
+                log(f"  Chart: {d['symbol']}")
+                fig = plot_single_ticker(d, col, prefs=chart_prefs)
+                fig.canvas.manager.set_window_title(f"{d['symbol']} \u2014 {d['name']}")
+                figs_stock_single.append(fig)
 
-        if stock_list:
-            log("  Table: Stock Scorecard")
-            show_stock_table(stock_list, stock_colors, YEARS_BACK)
+            if stock_list:
+                log("  Table: Stock Scorecard")
+                show_stock_table(stock_list, stock_colors, YEARS_BACK)
 
-        if len(stock_list) > 1:
-            log("  Chart: Comparison")
-            fig_comparison = plot_comparison(stock_list, stock_colors)
-            fig_comparison.canvas.manager.set_window_title("Comparison \u2014 All Tickers")
-            log("  Chart: Snapshot")
-            fig_snapshot = plot_snapshot(stock_list, stock_colors)
-            fig_snapshot.canvas.manager.set_window_title("Snapshot \u2014 Latest Year")
+            if len(stock_list) > 1:
+                log("  Chart: Comparison")
+                fig_comparison = plot_comparison(stock_list, stock_colors)
+                fig_comparison.canvas.manager.set_window_title("Comparison \u2014 All Tickers")
+                log("  Chart: Snapshot")
+                fig_snapshot = plot_snapshot(stock_list, stock_colors)
+                fig_snapshot.canvas.manager.set_window_title("Snapshot \u2014 Latest Year")
 
-        if etf_list:
-            log("  Chart: ETF Overview")
-            fig_etf = plot_etf(etf_list, etf_colors, YEARS_BACK)
-            fig_etf.canvas.manager.set_window_title("ETF Overview")
-            log("  Table: ETF Scorecard")
-            show_etf_table(etf_list, etf_colors, YEARS_BACK)
+            if etf_list:
+                log("  Chart: ETF Overview")
+                fig_etf = plot_etf(etf_list, etf_colors, YEARS_BACK)
+                fig_etf.canvas.manager.set_window_title("ETF Overview")
+                log("  Table: ETF Scorecard")
+                show_etf_table(etf_list, etf_colors, YEARS_BACK)
 
         figs = figs_stock_single[:]
         for f in [fig_stock_table, fig_comparison, fig_snapshot, fig_etf, fig_etf_table]:
             if f is not None:
                 figs.append(f)
-
-        if not figs:
-            log("\nNo charts to display.")
-            sys.exit(1)
 
         if do_export:
             log("\nExporting session files\u2026", title="Exporting\u2026")
@@ -2006,15 +2065,14 @@ def main():
         except Exception:
             pass
 
-        # Don't show charts if the user already exited
-        if _root is not None:
-            try:
-                if not _root.winfo_exists():
+        if do_show and need_charts:
+            if _root is not None:
+                try:
+                    if not _root.winfo_exists():
+                        return
+                except Exception:
                     return
-            except Exception:
-                return
-
-        plt.show()
+            plt.show()
 
         # Charts closed — wait for Run Again or window close.
         # _run_again() will update _run_state and call root.quit().
@@ -2030,10 +2088,11 @@ def main():
         if not _run_state["selected"]:
             print("No tickers selected. Exiting.")
             sys.exit(0)
-        selected     = _run_state["selected"]
-        YEARS_BACK   = _run_state["years_back"]
+        selected      = _run_state["selected"]
+        YEARS_BACK    = _run_state["years_back"]
         force_refresh = _run_state["force_refresh"]
-        do_export    = _run_state["do_export"]
+        do_export     = _run_state["do_export"]
+        do_show       = _run_state.get("show_charts", True)
 
 
 def is_stale(conn, symbol, years_back, days=90):
@@ -2073,4 +2132,4 @@ if __name__ == "__main__":
         print("  UNHANDLED ERROR")
         print("="*60)
         traceback.print_exc()
-        input("\nPress Enter to close...")  
+        input("\nPress Enter to close...")

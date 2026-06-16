@@ -32,11 +32,11 @@ CLR_BTN_FG  = "#FFFFFF"
 TICK_FONT_SIZE = 14
 ROW_PADY       = 0
 ROW_PADX       = 8
-WINDOW_WIDTH   = 1400
+WINDOW_WIDTH   = 1600
 WINDOW_HEIGHT  = 0.2
 WINDOW_X       = 50
 WINDOW_Y       = 0
-YEARS_DEFAULT  = 11
+YEARS_DEFAULT  = 5
 
 MONO_FONT_SIZE = 12
 BOLD_FONT_SIZE = 12
@@ -1752,8 +1752,9 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     tk.Label(years_frame, text="yrs", bg=CLR_BG,
              fg=CLR_SUBTEXT, font=mono).pack(side="left", padx=(4, 0))
 
-    refresh_var = tk.BooleanVar(value=False)
-    export_var  = tk.BooleanVar(value=False)
+    refresh_var     = tk.BooleanVar(value=False)
+    export_var      = tk.BooleanVar(value=False)
+    show_charts_var = tk.BooleanVar(value=True)
 
     def _go():
         nonlocal result_tickers, result_years, result_refresh, result_export
@@ -1785,13 +1786,17 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
             _run_state["years_back"]    = result_years
             _run_state["force_refresh"] = result_refresh
             _run_state["do_export"]     = result_export
+            _run_state["show_charts"]   = show_charts_var.get()
         root.quit()
 
     def _make_toggle_btn(frame, label, var, side="right", padx=(0, 8)):
         container = tk.Frame(frame, bg=CLR_BG)
         container.pack(side=side, padx=padx)
-        btn = tk.Button(container, text="☐", font=tick_font,
-                        fg="#AAAAAA", bg=CLR_BG, activebackground=CLR_BG,
+        btn = tk.Button(container,
+                        text="☑" if var.get() else "☐",
+                        font=tick_font,
+                        fg=CLR_ACCENT if var.get() else "#AAAAAA",
+                        bg=CLR_BG, activebackground=CLR_BG,
                         relief="flat", bd=0, cursor="hand2", padx=0, pady=0)
         btn.pack(side="left")
         tk.Label(container, text=label, bg=CLR_BG,
@@ -1807,8 +1812,9 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     tk.Button(ctrl, text="▶  Go", bg=CLR_ACCENT, fg=CLR_BTN_FG,
               activebackground="#0082C8",
               command=_go, **btn_cfg).pack(side="right")
-    _make_toggle_btn(ctrl, "Re-download", refresh_var, side="right", padx=(0, 8))
-    _make_toggle_btn(ctrl, "Export files", export_var,  side="right", padx=(0, 8))
+    _make_toggle_btn(ctrl, "Show charts",  show_charts_var, side="right", padx=(0, 8))
+    _make_toggle_btn(ctrl, "Re-download",  refresh_var,     side="right", padx=(0, 8))
+    _make_toggle_btn(ctrl, "Export files", export_var,      side="right", padx=(0, 8))
 
     # ── Status panel (hidden until Go is pressed) ─────────────────────────
     status_panel = tk.Frame(root, bg=CLR_BG)
@@ -1868,6 +1874,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         search_var.set("")
         refresh_var.set(False)
         export_var.set(False)
+        show_charts_var.set(True)
         log_text.delete("1.0", "end")
         status_title_var.set("Loading…")
         hdr.pack(fill="x")
