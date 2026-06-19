@@ -4,6 +4,12 @@ IT Sector Fundamentals Dashboard
 Auto-downloads data from Yahoo Finance via yfinance.
 Saves/updates all ticker data to tickers/fundamentals.db (SQLite).
 
+2026-06-19 UPDATE — new metrics layer (growth/quality/valuation/balance
+sheet/capital return), split scorecard (see interactive_table.py), chart
+panel headline numbers + footer summary line, and per-panel data tables
+under each mini-chart in plot_single_ticker. Rule of 40 intentionally
+NOT included (mixed semis/software ticker list makes it misleading).
+
 CONFIGURE YOUR TICKERS HERE:
 """
 
@@ -15,7 +21,9 @@ CONFIGURE YOUR TICKERS HERE:
 
 # ─────────────────────────────────────────────────────────────────────────────
 from ticker_picker import pick_tickers, post_status
-from interactive_table import show_stock_table, show_etf_table
+from interactive_table import (
+    show_stock_table_growth, show_stock_table_valuation, show_etf_table
+)
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -47,6 +55,7 @@ PALETTE = [
 
 def get_color(i):
     return PALETTE[i % len(PALETTE)]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. DATABASE  (tickers/fundamentals.db)
@@ -187,6 +196,38 @@ def _create_tables(conn):
         except sqlite3.OperationalError:
             pass  # column already exists
 
+    # ── 2026-06-19: new ticker-level snapshot columns ──────────────────────
+    # These are current-snapshot values (not per-year history), used by the
+    # Valuation/Balance Sheet/Capital Return scorecard.
+    for col_def in (
+        "ev_ebitda REAL",
+        "net_debt_ebitda REAL",
+        "interest_coverage REAL",
+        "buyback_yield REAL",
+        "dividend_yield REAL",
+    ):
+        try:
+            conn.execute(f"ALTER TABLE tickers ADD COLUMN {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
+    # ── 2026-06-19: new annual_data columns for margins + raw totals ───────
+    # gross/op/net margin stored as % per year; raw revenue/shares stored
+    # for buyback-yield calc across years.
+    for col_def in (
+        "gross_margin REAL",
+        "op_margin REAL",
+        "net_margin REAL",
+        "fcf_margin REAL",
+        "shares_out REAL",
+    ):
+        try:
+            conn.execute(f"ALTER TABLE annual_data ADD COLUMN {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
 def upsert_ticker(conn, d, years_requested):
     now = datetime.now().isoformat(timespec="seconds")
     years_stored      = len(d["years"])
@@ -196,8 +237,10 @@ def upsert_ticker(conn, d, years_requested):
         INSERT INTO tickers
             (symbol, name, current_price, analyst_tp, analyst_low, analyst_high,
              consensus, trailing_pe, forward_pe, peg_ratio, last_updated,
-             years_stored, history_exhausted)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+             years_stored, history_exhausted,
+             ev_ebitda, net_debt_ebitda, interest_coverage,
+             buyback_yield, dividend_yield)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(symbol) DO UPDATE SET
             name              = excluded.name,
             current_price     = excluded.current_price,
@@ -210,25 +253,38 @@ def upsert_ticker(conn, d, years_requested):
             peg_ratio         = excluded.peg_ratio,
             last_updated      = excluded.last_updated,
             years_stored      = excluded.years_stored,
-            history_exhausted = excluded.history_exhausted
+            history_exhausted = excluded.history_exhausted,
+            ev_ebitda          = excluded.ev_ebitda,
+            net_debt_ebitda     = excluded.net_debt_ebitda,
+            interest_coverage   = excluded.interest_coverage,
+            buyback_yield       = excluded.buyback_yield,
+            dividend_yield      = excluded.dividend_yield
     """, (
         d["symbol"], d["name"], d["current_price"],
         d["analyst_tp"], d["analyst_low"], d["analyst_high"],
         d["consensus"], d["trailing_pe"], d["forward_pe"],
         d.get("peg_ratio"), now,
         years_stored, history_exhausted,
+        d.get("ev_ebitda"), d.get("net_debt_ebitda"), d.get("interest_coverage"),
+        d.get("buyback_yield"), d.get("dividend_yield"),
     ))
 
     rows = zip(
         d["years"],  d["prices"], d["eps"],   d["pe"],
         d["roe"],    d["bvps"],   d["debt_assets"],
         d["ocfps"],  d["fcfps"],  d["revps"],  d["divps"],
+        d.get("gross_margin", [None]*len(d["years"])),
+        d.get("op_margin",    [None]*len(d["years"])),
+        d.get("net_margin",   [None]*len(d["years"])),
+        d.get("fcf_margin",   [None]*len(d["years"])),
+        d.get("shares_out",   [None]*len(d["years"])),
     )
     conn.executemany("""
         INSERT INTO annual_data
             (symbol, fiscal_year, price, eps, pe, roe, bvps,
-             debt_assets, ocfps, fcfps, revps, divps)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+             debt_assets, ocfps, fcfps, revps, divps,
+             gross_margin, op_margin, net_margin, fcf_margin, shares_out)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(symbol, fiscal_year) DO UPDATE SET
             price       = excluded.price,
             eps         = excluded.eps,
@@ -239,9 +295,16 @@ def upsert_ticker(conn, d, years_requested):
             ocfps       = excluded.ocfps,
             fcfps       = excluded.fcfps,
             revps       = excluded.revps,
-            divps       = excluded.divps
-    """, [(d["symbol"], yr, p, e, pe, roe, bvps, da, ocf, fcf, rev, div)
-          for yr, p, e, pe, roe, bvps, da, ocf, fcf, rev, div in rows])
+            divps       = excluded.divps,
+            gross_margin = excluded.gross_margin,
+            op_margin    = excluded.op_margin,
+            net_margin   = excluded.net_margin,
+            fcf_margin   = excluded.fcf_margin,
+            shares_out   = excluded.shares_out
+    """, [(d["symbol"], yr, p, e, pe, roe, bvps, da, ocf, fcf, rev, div,
+           gm, om, nm, fm, so)
+          for yr, p, e, pe, roe, bvps, da, ocf, fcf, rev, div, gm, om, nm, fm, so
+          in rows])
 
     conn.commit()
     print(f"    → Saved {d['symbol']} to DB ({len(d['years'])} years)")
@@ -277,6 +340,11 @@ def load_ticker_from_db(conn, symbol):
         "fcfps":         col("fcfps"),
         "revps":         col("revps"),
         "divps":         col("divps"),
+        "gross_margin":  col("gross_margin"),
+        "op_margin":     col("op_margin"),
+        "net_margin":    col("net_margin"),
+        "fcf_margin":    col("fcf_margin"),
+        "shares_out":    col("shares_out"),
         "current_price": row["current_price"],
         "analyst_tp":    row["analyst_tp"],
         "analyst_low":   row["analyst_low"],
@@ -285,6 +353,11 @@ def load_ticker_from_db(conn, symbol):
         "trailing_pe":   row["trailing_pe"],
         "forward_pe":    row["forward_pe"],
         "peg_ratio":     row["peg_ratio"],
+        "ev_ebitda":         row["ev_ebitda"],
+        "net_debt_ebitda":   row["net_debt_ebitda"],
+        "interest_coverage": row["interest_coverage"],
+        "buyback_yield":     row["buyback_yield"],
+        "dividend_yield":    row["dividend_yield"],
     }
 
 def upsert_etf(conn, d, years_requested):
@@ -393,7 +466,8 @@ def export_full_csv(conn):
             t.current_price, t.analyst_tp, t.analyst_low, t.analyst_high,
             t.consensus, t.last_updated,
             a.price, a.eps, a.pe, a.roe, a.bvps, a.debt_assets,
-            a.ocfps, a.fcfps, a.revps, a.divps
+            a.ocfps, a.fcfps, a.revps, a.divps,
+            a.gross_margin, a.op_margin, a.net_margin, a.fcf_margin, a.shares_out
         FROM annual_data a
         JOIN tickers t ON t.symbol = a.symbol
         ORDER BY t.symbol, a.fiscal_year
@@ -405,6 +479,7 @@ def export_full_csv(conn):
         "consensus", "last_updated",
         "price", "eps", "pe", "roe", "bvps", "debt_assets",
         "ocfps", "fcfps", "revps", "divps",
+        "gross_margin", "op_margin", "net_margin", "fcf_margin", "shares_out",
     ]
 
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -638,6 +713,60 @@ def download_ticker(symbol, years_back):
             annual = divs[divs.index.year == yr].sum()
             divps.append(round(float(annual), 4))
 
+        # ── 2026-06-19: new per-year fields ─────────────────────────────────
+
+        # Gross margin % — Gross Profit / Total Revenue
+        gp_row = safe_row(inc, "Gross Profit", "GrossProfit")
+        gross_margin = []
+        for d in dates:
+            try:
+                gp  = float(gp_row[d])
+                rev = float(rev_row[d])
+                gross_margin.append(round(gp / rev * 100, 2) if rev else None)
+            except Exception:
+                gross_margin.append(None)
+
+        # Operating margin % — Operating Income / Total Revenue
+        op_inc_row = safe_row(inc, "Operating Income", "OperatingIncome", "EBIT")
+        op_margin = []
+        for d in dates:
+            try:
+                oi  = float(op_inc_row[d])
+                rev = float(rev_row[d])
+                op_margin.append(round(oi / rev * 100, 2) if rev else None)
+            except Exception:
+                op_margin.append(None)
+
+        # Net margin % — Net Income / Total Revenue  (mum's request)
+        net_margin = []
+        for d in dates:
+            try:
+                ni  = float(ni_row[d])
+                rev = float(rev_row[d])
+                net_margin.append(round(ni / rev * 100, 2) if rev else None)
+            except Exception:
+                net_margin.append(None)
+
+        # FCF margin % — (OCF + CapEx) / Total Revenue
+        fcf_margin = []
+        for d in dates:
+            try:
+                ocf   = float(ocf_row[d])
+                capex = float(capex_row[d]) if capex_row is not None else 0
+                rev   = float(rev_row[d])
+                fcf_margin.append(round((ocf + capex) / rev * 100, 2) if rev else None)
+            except Exception:
+                fcf_margin.append(None)
+
+        # Shares outstanding per year — straight from the shares_row used
+        # above for per-share calcs, stored separately for buyback-yield.
+        shares_out = []
+        for d in dates:
+            try:
+                shares_out.append(round(float(shares_row[d]), 0) if shares_row is not None else None)
+            except Exception:
+                shares_out.append(None)
+
         current_price = info.get("currentPrice") or info.get("regularMarketPrice")
         analyst_tp    = info.get("targetMeanPrice")
         analyst_low   = info.get("targetLowPrice")
@@ -651,6 +780,54 @@ def download_ticker(symbol, years_back):
             info.get("sharesPercentSharesOut") or
             info.get("shortPercent")
         )
+
+        # ── 2026-06-19: current-snapshot valuation/balance-sheet metrics ────
+        # These are point-in-time (not historical series) since yfinance
+        # doesn't expose clean historical EV or market cap per fiscal year.
+
+        enterprise_value = info.get("enterpriseValue")
+        ebitda           = info.get("ebitda")
+        ev_ebitda = None
+        if enterprise_value and ebitda and ebitda > 0:
+            ev_ebitda = round(enterprise_value / ebitda, 2)
+
+        total_debt_cur = info.get("totalDebt")
+        total_cash_cur = info.get("totalCash")
+        net_debt_ebitda = None
+        if total_debt_cur is not None and total_cash_cur is not None and ebitda and ebitda > 0:
+            net_debt = total_debt_cur - total_cash_cur
+            net_debt_ebitda = round(net_debt / ebitda, 2)
+
+        # Interest coverage — EBIT / interest expense, using most recent
+        # fiscal year's income-statement figures (not the `info` snapshot,
+        # since interest expense isn't reliably in `info`).
+        interest_coverage = None
+        try:
+            int_exp_row = safe_row(inc, "Interest Expense", "InterestExpense")
+            latest_date = dates[-1]
+            ebit_latest = float(op_inc_row[latest_date])
+            int_exp     = float(int_exp_row[latest_date]) if int_exp_row is not None else None
+            if int_exp and int_exp != 0:
+                interest_coverage = round(abs(ebit_latest / int_exp), 2)
+        except Exception:
+            interest_coverage = None
+
+        # Buyback yield — % change in shares outstanding over the most
+        # recent year, sign-flipped so a shrinking share count is positive
+        # (i.e. "yield" to existing holders).
+        buyback_yield = None
+        try:
+            valid_shares = [(y, s) for y, s in zip(years, shares_out) if s is not None]
+            if len(valid_shares) >= 2:
+                first_s, last_s = valid_shares[0][1], valid_shares[-1][1]
+                if first_s and first_s > 0:
+                    buyback_yield = round((first_s - last_s) / first_s * 100, 2)
+        except Exception:
+            buyback_yield = None
+
+        dividend_yield = info.get("dividendYield")
+        if dividend_yield is not None:
+            dividend_yield = round(dividend_yield * 100, 2) if dividend_yield < 1 else round(dividend_yield, 2)
 
         print("OK")
         return {
@@ -667,6 +844,11 @@ def download_ticker(symbol, years_back):
             "fcfps":         fcfps,
             "revps":         revps,
             "divps":         divps,
+            "gross_margin":  gross_margin,
+            "op_margin":     op_margin,
+            "net_margin":    net_margin,
+            "fcf_margin":    fcf_margin,
+            "shares_out":    shares_out,
             "current_price": current_price,
             "analyst_tp":    analyst_tp,
             "analyst_low":   analyst_low,
@@ -676,6 +858,11 @@ def download_ticker(symbol, years_back):
             "forward_pe":    forward_pe,
             "peg_ratio":     peg_ratio,
             "short_float":   short_float,
+            "ev_ebitda":          ev_ebitda,
+            "net_debt_ebitda":    net_debt_ebitda,
+            "interest_coverage":  interest_coverage,
+            "buyback_yield":      buyback_yield,
+            "dividend_yield":     dividend_yield,
         }
 
     except Exception as e:
@@ -784,6 +971,60 @@ def add_zero_line(ax):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 3a. CAGR / MARGIN HELPERS  (2026-06-19)
+# ─────────────────────────────────────────────────────────────────────────────
+# Single shared implementation used by: chart panel titles, footer summary
+# line, and (duplicated, by design — see interactive_table.py header note)
+# the scorecard tables.
+
+def cagr_pct(values, n_years):
+    """
+    Fixed-window CAGR over the most recent n_years. Returns None if there
+    isn't n_years+1 of clean history or the start value isn't usable.
+    """
+    clean_vals = [v for v in values if v is not None]
+    if len(clean_vals) < n_years + 1:
+        return None
+    end, start = clean_vals[-1], clean_vals[-(n_years + 1)]
+    if start is None or end is None or start <= 0:
+        return None
+    return round(((end / start) ** (1 / n_years) - 1) * 100, 2)
+
+
+def cagr_full_window(values, years_list):
+    """
+    Full-window CAGR — from the first valid (year, value) pair to the last
+    in the given window, regardless of how many years that window spans.
+    This is the "always start of search window to end" version used for
+    chart panel headlines and the footer summary line, since those should
+    describe exactly what's plotted on screen.
+    """
+    pairs = [(y, v) for y, v in zip(years_list, values) if v is not None and v > 0]
+    if len(pairs) < 2:
+        return None
+    n = pairs[-1][0] - pairs[0][0]
+    if n <= 0:
+        return None
+    return round(((pairs[-1][1] / pairs[0][1]) ** (1 / n) - 1) * 100, 1)
+
+
+def margin_trend(margin_list):
+    """Latest margin minus earliest available margin in the window (pp)."""
+    clean_vals = [v for v in margin_list if v is not None]
+    if len(clean_vals) < 2:
+        return None
+    return round(clean_vals[-1] - clean_vals[0], 2)
+
+
+def fmt_pct(val, decimals=1):
+    return f"{val:+.{decimals}f}%" if val is not None else "N/A"
+
+
+def fmt_x(val, decimals=2):
+    return f"{val:.{decimals}f}x" if val is not None else "N/A"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 3b. TRIM HELPER
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -799,6 +1040,7 @@ def add_zero_line(ax):
 STOCK_LIST_FIELDS = [
     "years", "prices", "eps", "pe", "roe", "bvps",
     "debt_assets", "ocfps", "fcfps", "revps", "divps",
+    "gross_margin", "op_margin", "net_margin", "fcf_margin", "shares_out",
 ]
 ETF_LIST_FIELDS = ["years", "prices", "distributions", "annual_returns"]
 
@@ -844,6 +1086,84 @@ def ticker_legend(ax, data_list, colors):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 4b. PER-PANEL DATA TABLE  (2026-06-19)
+# ─────────────────────────────────────────────────────────────────────────────
+# Small table placed directly under a chart panel, one row per series shown
+# in that panel, one column per year matching the chart's x-axis. Row label
+# colours match each series' chart colour so it reads the same way the
+# Stock Scorecard tables already do.
+
+def _draw_panel_table(ax_table, yrs, series_rows):
+    """
+    ax_table     : the matplotlib Axes to draw the table into (already
+                   sized/positioned via nested GridSpec — this function
+                   just turns its axis off and fills it with a table)
+    yrs          : list of year label strings, same order as the chart
+    series_rows  : list of (row_label, color, values, fmt_fn) tuples
+                   values must be the same length as yrs (None allowed)
+    """
+    ax_table.axis("off")
+    if not series_rows:
+        return
+
+    n_cols = len(yrs)
+    n_rows = len(series_rows)
+
+    cell_text   = []
+    row_labels  = []
+    row_colors  = []
+
+    for label, color, values, fmt_fn in series_rows:
+        row_labels.append(label)
+        row_colors.append(color)
+        row = []
+        for v in values:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                row.append("—")
+            else:
+                row.append(fmt_fn(v))
+        cell_text.append(row)
+
+    tbl = ax_table.table(
+        cellText=cell_text,
+        rowLabels=row_labels,
+        colLabels=None,        # years already shown on the chart's x-axis above
+        cellLoc="center",
+        rowLoc="right",
+        loc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+    tbl.scale(1.0, 1.3)
+
+    for (row_idx, col_idx), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#E0E0E0")
+        cell.set_linewidth(0.5)
+        if col_idx == -1:
+            # Row-label cell — colour the text to match the series
+            color = row_colors[row_idx] if row_idx < len(row_colors) else "#333"
+            cell.set_text_props(color=color, fontweight="bold")
+            cell.set_facecolor("#FAFAFA")
+        else:
+            cell.set_facecolor("white" if row_idx % 2 == 0 else "#F7F9FC")
+
+
+def _make_panel_gridspec(fig, outer_gs_cell, height_ratio=(5, 1)):
+    """
+    Splits one outer GridSpec cell into a chart sub-axis (top) and a table
+    sub-axis (bottom), via a nested GridSpecFromSubplotSpec. Returns
+    (chart_ax, table_ax).
+    """
+    inner = gridspec.GridSpecFromSubplotSpec(
+        2, 1, subplot_spec=outer_gs_cell,
+        height_ratios=list(height_ratio), hspace=0.04,
+    )
+    chart_ax = fig.add_subplot(inner[0])
+    table_ax = fig.add_subplot(inner[1])
+    return chart_ax, table_ax
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 5. INDIVIDUAL-TICKER CHARTS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -863,16 +1183,29 @@ def plot_single_ticker(d, color, prefs=None):
 
     apply_style()
     year_range = f"{d['years'][0]}–{d['years'][-1]}" if d.get("years") else ""
-    fig = plt.figure(figsize=(16, 10), facecolor="white")
+    fig = plt.figure(figsize=(16, 11), facecolor="white")   # room for per-panel tables, tightened
     fig.suptitle(f"{d['symbol']} — {d['name']}  |  Fundamentals {year_range}",
-                 fontsize=14, fontweight="bold", y=0.98)
+                 fontsize=14, fontweight="bold", y=0.985)
 
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.45, wspace=0.38)
+    # Outer 2x3 grid, each cell will itself be split chart/table via
+    # _make_panel_gridspec. height_ratios on the outer grid keep all six
+    # outer cells the same height; the 3:1 chart:table split happens inside.
+    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.22, wspace=0.40,
+                             top=0.94, bottom=0.07)
     yrs = year_labels(d["years"])
     x   = np.arange(len(yrs))
 
-    # ── Panel 1: Share Price (always line) ────────────────────────────────────
-    ax1 = fig.add_subplot(gs[0, 0])
+    # Pre-compute all full-window CAGRs used in panel titles + footer
+    price_cagr = cagr_full_window(d["prices"], d["years"])
+    eps_cagr_v = cagr_full_window(d["eps"], d["years"])
+    bvps_cagr  = cagr_full_window(d["bvps"], d["years"])
+    fcf_cagr   = cagr_full_window(d.get("fcfps", []), d["years"])
+    rev_cagr   = cagr_full_window(d.get("revps", []), d["years"])
+    roe_avg_full = round(np.nanmean([v for v in d["roe"] if v is not None]), 1) \
+                   if any(v is not None for v in d["roe"]) else None
+
+    # ── Panel 1: Share Price ────────────────────────────────────────────────
+    ax1, tbl1 = _make_panel_gridspec(fig, gs[0, 0])
     ax1.plot(yrs, clean(d["prices"]), color=color, linewidth=2, marker="o", markersize=4)
     if d.get("current_price"):
         ax1.axhline(d["current_price"], color=color, linestyle="--", linewidth=1,
@@ -880,20 +1213,23 @@ def plot_single_ticker(d, color, prefs=None):
     if d.get("analyst_tp"):
         ax1.axhline(d["analyst_tp"], color="#888", linestyle=":", linewidth=1,
                     label=f"TP ${d['analyst_tp']:,.2f}")
-    ax1.set_title("Share Price ($)", fontsize=10, fontweight="bold")
+    title1 = "Share Price ($)"
+    if price_cagr is not None:
+        title1 += f"   ·   CAGR {price_cagr:+.1f}%"
+    ax1.set_title(title1, fontsize=10, fontweight="bold")
     ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=8)
     ax1.legend(fontsize=7)
     add_zero_line(ax1)
+    _draw_panel_table(tbl1, yrs, [
+        ("Price ($)", color, d["prices"], lambda v: f"${v:,.0f}"),
+    ])
 
     # ── Panel 2: P/E & PEG ───────────────────────────────────────────────────
-    # Left axis: historical P/E (bar or line per pref)
-    # Right axis: historical PEG (always line, orange)
-    # Dotted lines: current forward P/E (gold) and current PEG (coral)
     hist_peg = compute_historical_peg(d["pe"], d["eps"])
     s2_pe  = prefs.get("panel2_pe",  "bar")
     s2_peg = prefs.get("panel2_peg", "line")
 
-    ax2 = fig.add_subplot(gs[0, 1])
+    ax2, tbl2 = _make_panel_gridspec(fig, gs[0, 1])
     ax2.set_axisbelow(True)
     ax2b = ax2.twinx()
     ax2b.set_axisbelow(True)
@@ -922,21 +1258,30 @@ def plot_single_ticker(d, color, prefs=None):
                                    linewidth=1.4, label=f"Cur PEG {cur_peg:.2f}"))
 
     ax2b.axhline(0, color="#ccc", linewidth=0.8, zorder=0)
-    ax2.set_title("P/E Ratio & PEG", fontsize=10, fontweight="bold")
+    avg_pe_5 = None
+    pe_clean = [v for v in d["pe"] if v is not None]
+    if pe_clean:
+        avg_pe_5 = round(sum(pe_clean[-5:]) / len(pe_clean[-5:]), 1)
+    title2 = "P/E Ratio & PEG"
+    if fwd_pe and avg_pe_5:
+        title2 += f"   ·   Fwd/Avg {fwd_pe/avg_pe_5:.2f}x"
+    ax2.set_title(title2, fontsize=10, fontweight="bold")
     ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=8)
     ax2.tick_params(axis="y", labelsize=8)
     ax2b.tick_params(axis="y", labelsize=8, colors="#F59E0B")
     ax2b.set_ylabel("PEG", fontsize=8, color="#F59E0B")
     ax2.legend(handles=legend_lines, fontsize=7)
     add_zero_line(ax2)
+    _draw_panel_table(tbl2, yrs, [
+        ("P/E", color, d["pe"], lambda v: f"{v:.1f}x"),
+        ("PEG", "#F59E0B", hist_peg, lambda v: f"{v:.2f}"),
+    ])
 
     # ── Panel 3: EPS & ROE ───────────────────────────────────────────────────
-    # Left axis: EPS (bar or line per pref)
-    # Right axis: ROE % (always line, red)
     s3_eps = prefs.get("panel3_eps", "bar")
     s3_roe = prefs.get("panel3_roe", "line")
 
-    ax3 = fig.add_subplot(gs[0, 2])
+    ax3, tbl3 = _make_panel_gridspec(fig, gs[0, 2])
     ax3.set_axisbelow(True)
     ax3b = ax3.twinx()
     ax3b.set_axisbelow(True)
@@ -945,7 +1290,10 @@ def plot_single_ticker(d, color, prefs=None):
     _draw_series(ax3, yrs, x, d["eps"], s3_eps, color, alpha=0.50, label="EPS ($)")
     _draw_series(ax3b, yrs, x, d["roe"], s3_roe, "#EF4444", alpha=0.60, label="ROE (%)", marker="s")
 
-    ax3.set_title("EPS ($) & ROE (%)", fontsize=10, fontweight="bold")
+    title3 = "EPS ($) & ROE (%)"
+    if eps_cagr_v is not None:
+        title3 += f"   ·   EPS CAGR {eps_cagr_v:+.1f}%"
+    ax3.set_title(title3, fontsize=10, fontweight="bold")
     ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=8)
     ax3.tick_params(axis="y", labelsize=8)
     ax3b.tick_params(axis="y", labelsize=8, colors="#EF4444")
@@ -958,15 +1306,17 @@ def plot_single_ticker(d, color, prefs=None):
     ]
     ax3.legend(handles=lines3, fontsize=7)
     add_zero_line(ax3)
+    _draw_panel_table(tbl3, yrs, [
+        ("EPS ($)", color, d["eps"], lambda v: f"${v:.2f}"),
+        ("ROE (%)", "#EF4444", d["roe"], lambda v: f"{v:.1f}%"),
+    ])
 
     # ── Panel 4: Book Value/Share & Debt/Assets ───────────────────────────────
-    # Left axis: BV/Share (bar or line per pref)
-    # Right axis: Debt/Assets % (always line, teal)
     s4_bvps = prefs.get("panel4_bvps", "bar")
     s4_debt = prefs.get("panel4_debt", "line")
     da_pct = [v * 100 if v is not None else None for v in d["debt_assets"]]
 
-    ax4 = fig.add_subplot(gs[1, 0])
+    ax4, tbl4 = _make_panel_gridspec(fig, gs[1, 0])
     ax4.set_axisbelow(True)
     ax4b = ax4.twinx()
     ax4b.set_axisbelow(True)
@@ -975,7 +1325,10 @@ def plot_single_ticker(d, color, prefs=None):
     _draw_series(ax4, yrs, x, d["bvps"], s4_bvps, color, alpha=0.50, label="BV/Sh ($)")
     _draw_series(ax4b, yrs, x, da_pct, s4_debt, "#06B6D4", alpha=0.60, label="Debt/Assets (%)")
 
-    ax4.set_title("Book Value/Share & Debt/Assets", fontsize=10, fontweight="bold")
+    title4 = "Book Value/Share & Debt/Assets"
+    if bvps_cagr is not None:
+        title4 += f"   ·   BVPS CAGR {bvps_cagr:+.1f}%"
+    ax4.set_title(title4, fontsize=10, fontweight="bold")
     ax4.set_xticks(x[::2]); ax4.set_xticklabels(yrs[::2], fontsize=8)
     ax4.tick_params(axis="y", labelsize=8)
     ax4b.tick_params(axis="y", labelsize=8, colors="#06B6D4")
@@ -988,37 +1341,52 @@ def plot_single_ticker(d, color, prefs=None):
     ]
     ax4.legend(handles=lines4, fontsize=7)
     add_zero_line(ax4)
+    _draw_panel_table(tbl4, yrs, [
+        ("BV/Sh ($)", color, d["bvps"], lambda v: f"${v:.2f}"),
+        ("Debt/Assets", "#06B6D4", da_pct, lambda v: f"{v:.1f}%"),
+    ])
 
     # ── Panel 5: OCF/Share & FCF/Share ───────────────────────────────────────
     s5_ocf = prefs.get("panel5_ocf", "bar")
     s5_fcf = prefs.get("panel5_fcf", "line")
 
-    ax5 = fig.add_subplot(gs[1, 1])
+    ax5, tbl5 = _make_panel_gridspec(fig, gs[1, 1])
     ax5.set_axisbelow(True)
     _draw_series(ax5, yrs, x, d["ocfps"], s5_ocf, color, alpha=0.50, label="OCF/Sh ($)")
     _draw_series(ax5, yrs, x, d["fcfps"], s5_fcf, "#10B981", alpha=0.90, label="FCF/Sh ($)", marker="o", linewidth=2.5)
-    ax5.set_title("OCF/Share & FCF/Share ($)", fontsize=10, fontweight="bold")
+    title5 = "OCF/Share & FCF/Share ($)"
+    if fcf_cagr is not None:
+        title5 += f"   ·   FCF CAGR {fcf_cagr:+.1f}%"
+    ax5.set_title(title5, fontsize=10, fontweight="bold")
     ax5.set_xticks(x[::2]); ax5.set_xticklabels(yrs[::2], fontsize=8)
     ax5.tick_params(axis="y", labelsize=8)
     ax5.legend(fontsize=7)
     add_zero_line(ax5)
+    _draw_panel_table(tbl5, yrs, [
+        ("OCF/Sh ($)", color, d["ocfps"], lambda v: f"${v:.2f}"),
+        ("FCF/Sh ($)", "#10B981", d["fcfps"], lambda v: f"${v:.2f}"),
+    ])
 
     # ── Panel 6: Revenue/Share & Div/Share ───────────────────────────────────
     s6_rev = prefs.get("panel6_rev", "bar")
     s6_div = prefs.get("panel6_div", "line")
 
-    ax6 = fig.add_subplot(gs[1, 2])
+    ax6, tbl6 = _make_panel_gridspec(fig, gs[1, 2])
     ax6.set_axisbelow(True)
     ax6b = ax6.twinx()
     ax6b.set_axisbelow(True)
     ax6b.grid(False)
 
     _draw_series(ax6, yrs, x, d["revps"], s6_rev, color, alpha=0.50, label="Rev/Sh ($)")
-    if any(v and v > 0 for v in d["divps"]):
+    has_divs = any(v and v > 0 for v in d["divps"])
+    if has_divs:
         _draw_series(ax6b, yrs, x, d["divps"], s6_div, "#7C3AED", alpha=0.80, label="Div/Sh ($)", marker="D")
         ax6b.tick_params(axis="y", labelsize=8, colors="#8B5CF6")
         ax6b.set_ylabel("Div/Sh ($)", fontsize=8, color="#8B5CF6")
-    ax6.set_title("Revenue/Share & Div/Share ($)", fontsize=10, fontweight="bold")
+    title6 = "Revenue/Share & Div/Share ($)"
+    if rev_cagr is not None:
+        title6 += f"   ·   Rev/Sh CAGR {rev_cagr:+.1f}%"
+    ax6.set_title(title6, fontsize=10, fontweight="bold")
     ax6.set_xticks(x[::2]); ax6.set_xticklabels(yrs[::2], fontsize=8)
     ax6.tick_params(axis="y", labelsize=8)
     lines6 = [
@@ -1029,20 +1397,38 @@ def plot_single_ticker(d, color, prefs=None):
     ]
     ax6.legend(handles=lines6, fontsize=7)
     add_zero_line(ax6)
+    table6_rows = [("Rev/Sh ($)", color, d["revps"], lambda v: f"${v:.2f}")]
+    if has_divs:
+        table6_rows.append(("Div/Sh ($)", "#7C3AED", d["divps"], lambda v: f"${v:.2f}"))
+    _draw_panel_table(tbl6, yrs, table6_rows)
 
-    # ── Footer ────────────────────────────────────────────────────────────────
+    # ── Footer — full-window summary line ────────────────────────────────────
     consensus_str = d.get("consensus", "")
     tp_str  = f"  TP ${d['analyst_tp']:,.2f}" if d.get("analyst_tp") else ""
     low_str = f"  Low ${d['analyst_low']:,.2f}" if d.get("analyst_low") else ""
     hi_str  = f"  High ${d['analyst_high']:,.2f}" if d.get("analyst_high") else ""
     peg_str = f"  PEG {cur_peg:.2f}" if cur_peg else ""
-    fig.text(0.5, 0.01,
+    fig.text(0.5, 0.035,
              f"Analyst Consensus: {consensus_str}{tp_str}{low_str}{hi_str}{peg_str}",
              ha="center", fontsize=9, color="#555", fontfamily="monospace")
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.97])
+    summary_parts = []
+    if rev_cagr is not None:
+        summary_parts.append(f"Rev CAGR: {rev_cagr:+.1f}%")
+    if eps_cagr_v is not None:
+        summary_parts.append(f"EPS CAGR: {eps_cagr_v:+.1f}%")
+    if fcf_cagr is not None:
+        summary_parts.append(f"FCF CAGR: {fcf_cagr:+.1f}%")
+    if roe_avg_full is not None:
+        summary_parts.append(f"ROE avg: {roe_avg_full:.1f}%")
+    if fwd_pe and avg_pe_5:
+        summary_parts.append(f"Fwd PE vs Hist: {fwd_pe/avg_pe_5:.2f}x")
+    if summary_parts:
+        fig.text(0.5, 0.012, "  |  ".join(summary_parts),
+                 ha="center", fontsize=9, fontweight="bold",
+                 color="#1A1A2E", fontfamily="monospace")
 
-    for ax in fig.axes:
+    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
         mplcursors.cursor(ax, hover=True)
     return fig
 
@@ -1096,163 +1482,6 @@ def plot_comparison(data_list, colors):
     plt.tight_layout(rect=[0, 0, 1, 0.97], h_pad=3.0)
     for ax in fig.axes:
         mplcursors.cursor(ax, hover=True)
-    return fig
-
-def plot_stock_table(data_list, colors, years_back):
-    apply_style()
-
-    def eps_cagr(eps_list, years_list):
-        pairs = [(y, e) for y, e in zip(years_list, eps_list)
-                 if e is not None and e > 0]
-        if len(pairs) < 2:
-            return None
-        n = pairs[-1][0] - pairs[0][0]
-        if n <= 0:
-            return None
-        return round(((pairs[-1][1] / pairs[0][1]) ** (1 / n) - 1) * 100, 1)
-
-    def avg_last_n(values, n):
-        clean_vals = [v for v in values if v is not None]
-        subset = clean_vals[-n:]
-        if not subset:
-            return None
-        return round(sum(subset) / len(subset), 2)
-
-    def pe_avg_5yr(pe_list):
-        return avg_last_n(pe_list, 5)
-
-    col_labels = [
-        "Name",
-        "Price\n(current)",
-        f"EPS CAGR\n({years_back - 1}yr)",
-        "Fwd/Avg\nP/E ratio",
-        "P/E\n(forward)",
-        "P/E\n(trailing)",
-        "P/E\n(5yr avg)",
-        "FCF/Sh $\n(latest)",
-        "FCF/Sh $\n(3yr avg)",
-        "ROE %\n(latest)",
-        "ROE %\n(3yr avg)",
-    ]
-    row_labels = [d["symbol"] for d in data_list]
-
-    table_data = []
-    cell_colors = []
-
-    for d in data_list:
-        row = []
-        crow = []
-
-        row.append(d.get("name", "")); crow.append("#EAF4FB")
-
-        cur_price = d.get("current_price")
-        if cur_price is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"${float(cur_price):,.2f}"); crow.append("#EAF4FB")
-
-        val = eps_cagr(d["eps"], d["years"])
-        if val is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"{val:+.1f}%")
-            crow.append("#D4EDDA" if val >= 0 else "#F8D7DA")
-
-        cur_pe = d.get("trailing_pe")
-        cur_pe = float(cur_pe) if cur_pe is not None else None
-        fwd_pe = d.get("forward_pe")
-        fwd_pe = float(fwd_pe) if fwd_pe is not None else None
-        avg_pe = pe_avg_5yr(d["pe"])
-
-        if fwd_pe is not None and avg_pe is not None and avg_pe > 0:
-            ratio = round(fwd_pe / avg_pe, 2)
-            row.append(f"{ratio:.2f}x")
-            val_c = "#D4EDDA" if ratio < 0.8 else ("#FFF3CD" if ratio <= 1.1 else "#F8D7DA")
-            crow.append(val_c)
-        else:
-            row.append("N/A"); crow.append("#F0F0F0")
-
-        if fwd_pe is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"{fwd_pe:.1f}x"); crow.append("#FFF9E6")
-
-        if cur_pe is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"{cur_pe:.1f}x"); crow.append("#FFF9E6")
-
-        if avg_pe is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            cell_c = "#FFF9E6"
-            if cur_pe is not None:
-                cell_c = "#D4EDDA" if cur_pe < avg_pe else "#F8D7DA"
-            row.append(f"{avg_pe:.1f}x"); crow.append(cell_c)
-
-        fcf_lat = latest(d["fcfps"])
-        if np.isnan(fcf_lat):
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"${fcf_lat:.2f}")
-            crow.append("#D4EDDA" if fcf_lat >= 0 else "#F8D7DA")
-
-        fcf_avg = avg_last_n(d["fcfps"], 3)
-        if fcf_avg is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"${fcf_avg:.2f}")
-            crow.append("#D4EDDA" if fcf_avg >= 0 else "#F8D7DA")
-
-        roe_lat = latest(d["roe"])
-        if np.isnan(roe_lat):
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"{roe_lat:.1f}%")
-            crow.append("#D4EDDA" if roe_lat >= 15 else ("#FFF3CD" if roe_lat >= 8 else "#F8D7DA"))
-
-        roe_avg = avg_last_n(d["roe"], 3)
-        if roe_avg is None:
-            row.append("N/A"); crow.append("#F0F0F0")
-        else:
-            row.append(f"{roe_avg:.1f}%")
-            crow.append("#D4EDDA" if roe_avg >= 15 else ("#FFF3CD" if roe_avg >= 8 else "#F8D7DA"))
-
-        table_data.append(row)
-        cell_colors.append(crow)
-
-    fig_height = max(4.5, 2.0 + len(data_list) * 0.9)
-    fig, ax = plt.subplots(figsize=(14, fig_height), facecolor="white")
-    fig.suptitle("Stock Scorecard", fontsize=13, fontweight="bold", y=0.95)
-    ax.axis("off")
-
-    table = ax.table(
-        cellText=table_data,
-        rowLabels=row_labels,
-        colLabels=col_labels,
-        cellColours=cell_colors,
-        cellLoc="center",
-        rowLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.0, 2.4)
-
-    for col_idx in range(len(col_labels)):
-        table.auto_set_column_width(col_idx)
-
-    for (row_idx, col_idx), cell in table.get_celld().items():
-        cell.set_edgecolor("#CCCCCC")
-        if row_idx == 0 or col_idx == -1:
-            cell.set_facecolor("#E8F4FD")
-            cell.set_text_props(fontweight="bold")
-        if row_idx > 0 and col_idx >= 0:
-            text = cell.get_text().get_text()
-            if text == "N/A":
-                cell.get_text().set_color("#AAAAAA")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.88])
     return fig
 
 
@@ -1417,138 +1646,19 @@ def plot_etf(etf_list, colors, years_back):
         mplcursors.cursor(ax, hover=True)
     return fig
 
-def plot_etf_table(etf_list, colors, years_back):
-    apply_style()
-
-    periods = sorted(set([1, 3, 5, 10, years_back - 1]))
-
-    col_labels = (
-            ["Name"]
-            + [f"CAGR {p}yr" for p in periods]
-        + ["Best Year", "Worst Year", "Avg Return", "Volatility", "Total Return", "Yield %"]
-    )
-    row_labels = [d["symbol"] for d in etf_list]
-
-    table_data = []
-    cell_colors = []
-
-    for d in etf_list:
-        row = []
-        colors_row = []
-        row.append(d.get("name", "")); colors_row.append("#EAF4FB")
-
-        for p in periods:
-            val = cagr(d["prices"], p)
-            if val is None:
-                row.append("N/A"); colors_row.append("#F0F0F0")
-            else:
-                row.append(f"{val:+.1f}%")
-                colors_row.append("#D4EDDA" if val >= 0 else "#F8D7DA")
-
-        valid_returns = [(yr, r) for yr, r in zip(d["years"], d["annual_returns"])
-                         if r is not None]
-
-        if valid_returns:
-            best_yr, best_val = max(valid_returns, key=lambda x: x[1])
-            row.append(f"{best_yr}  {best_val:+.1f}%"); colors_row.append("#D4EDDA")
-        else:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        if valid_returns:
-            worst_yr, worst_val = min(valid_returns, key=lambda x: x[1])
-            row.append(f"{worst_yr}  {worst_val:+.1f}%"); colors_row.append("#F8D7DA")
-        else:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        if valid_returns:
-            avg = round(sum(r for _, r in valid_returns) / len(valid_returns), 1)
-            row.append(f"{avg:+.1f}%")
-            colors_row.append("#D4EDDA" if avg >= 0 else "#F8D7DA")
-        else:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        if len(valid_returns) >= 2:
-            ret_vals = [r for _, r in valid_returns]
-            vol = round(float(np.std(ret_vals, ddof=1)), 1)
-            row.append(f"{vol:.1f}%")
-            vol_color = "#D4EDDA" if vol < 12 else ("#FFF3CD" if vol < 20 else "#F8D7DA")
-            colors_row.append(vol_color)
-        else:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        # Total return — uses only the trimmed window (already sliced to years_back)
-        clean_prices = [p for p in d["prices"] if p is not None]
-        if len(clean_prices) >= 2:
-            total_ret = round((clean_prices[-1] / clean_prices[0] - 1) * 100, 1)
-            row.append(f"{total_ret:+.0f}%")
-            colors_row.append("#D4EDDA" if total_ret >= 0 else "#F8D7DA")
-        else:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        try:
-            latest_dist = next(
-                (d["distributions"][i] for i in range(len(d["years"]) - 1, -1, -1)
-                 if d["distributions"][i] is not None and d["distributions"][i] > 0),
-                None
-            )
-            cur_price = d.get("current_price")
-            if latest_dist and cur_price and cur_price > 0:
-                yield_pct = round(latest_dist / cur_price * 100, 2)
-                row.append(f"{yield_pct:.2f}%"); colors_row.append("#EAF4FB")
-            else:
-                row.append("N/A"); colors_row.append("#F0F0F0")
-        except Exception:
-            row.append("N/A"); colors_row.append("#F0F0F0")
-
-        table_data.append(row)
-        cell_colors.append(colors_row)
-
-    fig_height = max(4.5, 2.0 + len(etf_list) * 0.9)
-    fig, ax = plt.subplots(figsize=(18, fig_height), facecolor="white")
-    fig.suptitle("ETF Performance Summary", fontsize=13, fontweight="bold", y=0.95)
-    ax.axis("off")
-
-    table = ax.table(
-        cellText=table_data,
-        rowLabels=row_labels,
-        colLabels=col_labels,
-        cellColours=cell_colors,
-        cellLoc="center",
-        rowLoc="center",
-        loc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(11)
-    table.scale(1.0, 2.2)
-
-    for col_idx in range(len(col_labels)):
-        table.auto_set_column_width(col_idx)
-
-    for (row_idx, col_idx), cell in table.get_celld().items():
-        cell.set_edgecolor("#CCCCCC")
-        if row_idx == 0 or col_idx == -1:
-            cell.set_facecolor("#E8F4FD")
-            cell.set_text_props(fontweight="bold")
-        if row_idx > 0 and col_idx >= 0:
-            text = cell.get_text().get_text()
-            if text == "N/A":
-                cell.get_text().set_color("#AAAAAA")
-            elif "+" in text:
-                cell.get_text().set_color("#155724")
-            elif text and text[0] == "-":
-                cell.get_text().set_color("#721C24")
-
-    plt.tight_layout(rect=[0, 0, 1, 0.88])
-    return fig
 
 def export_session(stock_list, stock_colors, etf_list, etf_colors,
                    figs_stock_single, fig_comparison, fig_snapshot,
-                   fig_etf, fig_etf_table, fig_stock_table, years_back):
+                   fig_etf, fig_etf_table, fig_growth_table, fig_valuation_table,
+                   years_back):
     today = datetime.now().strftime("%Y-%m-%d")
     out   = make_session_folder(stock_list, etf_list)
     saved = []
 
     if stock_list:
+        # ── Combined scorecard CSV — every metric from both on-screen
+        # tables (Growth & Quality + Valuation/Balance Sheet/Capital
+        # Return) lives in one file, regardless of which window shows it.
         path = os.path.join(out, f"{today}_scorecard.csv")
 
         def avg_last_n(values, n):
@@ -1556,20 +1666,25 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
             subset = clean_vals[-n:]
             return round(sum(subset) / len(subset), 2) if subset else None
 
-        def eps_cagr(eps_list, years_list):
-            pairs = [(y, e) for y, e in zip(years_list, eps_list)
-                     if e is not None and e > 0]
-            if len(pairs) < 2:
-                return None
-            n = pairs[-1][0] - pairs[0][0]
-            if n <= 0:
-                return None
-            return round(((pairs[-1][1] / pairs[0][1]) ** (1 / n) - 1) * 100, 1)
-
         fieldnames = [
             "symbol", "name", "price",
-            f"eps_cagr_{years_back-1}yr",
+            # Growth
+            "eps_cagr_full", "eps_cagr_3yr", "eps_cagr_5yr",
+            "rev_cagr_3yr", "rev_cagr_5yr",
+            "fcf_cagr_full",
+            # Quality
+            "gross_margin_latest", "gross_margin_trend",
+            "op_margin_latest", "op_margin_trend",
+            "net_margin_latest", "net_margin_trend",
+            "fcf_margin_latest",
+            # Valuation
             "trailing_pe", "forward_pe", "pe_5yr_avg", "fwd_vs_avg_pe",
+            "price_fcf", "ev_ebitda",
+            # Balance sheet
+            "net_debt_ebitda", "interest_coverage",
+            # Capital return
+            "buyback_yield", "dividend_yield", "total_shareholder_yield",
+            # Existing
             "roe_latest", "roe_3yr_avg",
             "fcfps_latest", "fcfps_3yr_avg",
         ]
@@ -1584,19 +1699,51 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
                 cur_pe  = d.get("trailing_pe")
                 cur_pe  = float(cur_pe) if cur_pe is not None else None
                 fwd_avg = round(fwd_pe / avg_pe, 2) if fwd_pe and avg_pe and avg_pe > 0 else None
+
+                roe_l = latest(d["roe"])
+                fcf_l = latest(d["fcfps"])
+                price_fcf = None
+                cp = d.get("current_price")
+                if cp is not None and not np.isnan(fcf_l) and fcf_l > 0:
+                    price_fcf = round(float(cp) / fcf_l, 1)
+
+                bb_yield  = d.get("buyback_yield")
+                div_yield = d.get("dividend_yield")
+                tsy = (round(bb_yield + div_yield, 1)
+                       if bb_yield is not None and div_yield is not None else None)
+
                 writer.writerow({
-                    "symbol":                   d["symbol"],
-                    "name":                     d["name"],
-                    "price":                    d.get("current_price"),
-                    f"eps_cagr_{years_back-1}yr": eps_cagr(d["eps"], d["years"]),
-                    "trailing_pe":              cur_pe,
-                    "forward_pe":               fwd_pe,
-                    "pe_5yr_avg":               avg_pe,
-                    "fwd_vs_avg_pe":            fwd_avg,
-                    "roe_latest":               latest(d["roe"]) if not np.isnan(latest(d["roe"])) else None,
-                    "roe_3yr_avg":              avg_last_n(d["roe"], 3),
-                    "fcfps_latest":             latest(d["fcfps"]) if not np.isnan(latest(d["fcfps"])) else None,
-                    "fcfps_3yr_avg":            avg_last_n(d["fcfps"], 3),
+                    "symbol":  d["symbol"],
+                    "name":    d["name"],
+                    "price":   d.get("current_price"),
+                    "eps_cagr_full": cagr_full_window(d["eps"], d["years"]),
+                    "eps_cagr_3yr":  cagr_pct(d["eps"], 3),
+                    "eps_cagr_5yr":  cagr_pct(d["eps"], 5),
+                    "rev_cagr_3yr":  cagr_pct(d.get("revps", []), 3),
+                    "rev_cagr_5yr":  cagr_pct(d.get("revps", []), 5),
+                    "fcf_cagr_full": cagr_full_window(d.get("fcfps", []), d["years"]),
+                    "gross_margin_latest": (lambda v: None if np.isnan(v) else v)(latest(d.get("gross_margin", []))),
+                    "gross_margin_trend":  margin_trend(d.get("gross_margin", [])),
+                    "op_margin_latest":    (lambda v: None if np.isnan(v) else v)(latest(d.get("op_margin", []))),
+                    "op_margin_trend":     margin_trend(d.get("op_margin", [])),
+                    "net_margin_latest":   (lambda v: None if np.isnan(v) else v)(latest(d.get("net_margin", []))),
+                    "net_margin_trend":    margin_trend(d.get("net_margin", [])),
+                    "fcf_margin_latest":   (lambda v: None if np.isnan(v) else v)(latest(d.get("fcf_margin", []))),
+                    "trailing_pe":     cur_pe,
+                    "forward_pe":      fwd_pe,
+                    "pe_5yr_avg":      avg_pe,
+                    "fwd_vs_avg_pe":   fwd_avg,
+                    "price_fcf":       price_fcf,
+                    "ev_ebitda":       d.get("ev_ebitda"),
+                    "net_debt_ebitda": d.get("net_debt_ebitda"),
+                    "interest_coverage": d.get("interest_coverage"),
+                    "buyback_yield":   bb_yield,
+                    "dividend_yield":  div_yield,
+                    "total_shareholder_yield": tsy,
+                    "roe_latest":      None if np.isnan(roe_l) else roe_l,
+                    "roe_3yr_avg":     avg_last_n(d["roe"], 3),
+                    "fcfps_latest":    None if np.isnan(fcf_l) else fcf_l,
+                    "fcfps_3yr_avg":   avg_last_n(d["fcfps"], 3),
                 })
         saved.append(f"{today}_scorecard.csv")
 
@@ -1605,11 +1752,10 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
 
         fieldnames = [
             "symbol", "name", "fiscal_year",
-            # Per-year series (everything in the charts)
             "price", "eps", "pe", "historical_peg",
             "roe", "bvps", "debt_assets_pct",
             "ocfps", "fcfps", "revps", "divps",
-            # Current / analyst data (repeated per row for easy filtering)
+            "gross_margin", "op_margin", "net_margin", "fcf_margin", "shares_out",
             "current_price", "trailing_pe", "forward_pe", "peg_ratio",
             "analyst_tp", "analyst_low", "analyst_high", "consensus",
         ]
@@ -1620,6 +1766,11 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
 
             for d in stock_list:
                 hist_peg = compute_historical_peg(d["pe"], d["eps"])
+                gm = d.get("gross_margin", [None]*len(d["years"]))
+                om = d.get("op_margin",    [None]*len(d["years"]))
+                nm = d.get("net_margin",   [None]*len(d["years"]))
+                fm = d.get("fcf_margin",   [None]*len(d["years"]))
+                so = d.get("shares_out",   [None]*len(d["years"]))
 
                 for i, yr in enumerate(d["years"]):
                     da = d["debt_assets"][i]
@@ -1640,6 +1791,11 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
                         "fcfps": d["fcfps"][i],
                         "revps": d["revps"][i],
                         "divps": d["divps"][i],
+                        "gross_margin": gm[i] if i < len(gm) else None,
+                        "op_margin":    om[i] if i < len(om) else None,
+                        "net_margin":   nm[i] if i < len(nm) else None,
+                        "fcf_margin":   fm[i] if i < len(fm) else None,
+                        "shares_out":   so[i] if i < len(so) else None,
                         "current_price": d.get("current_price"),
                         "trailing_pe": d.get("trailing_pe"),
                         "forward_pe": d.get("forward_pe"),
@@ -1714,11 +1870,12 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
         saved.append(fname)
 
     pairs = [
-        (fig_stock_table, "scorecard"),
-        (fig_comparison,  "comparison"),
-        (fig_snapshot,    "snapshot"),
-        (fig_etf,         "etf_overview"),
-        (fig_etf_table,   "etf_table"),
+        (fig_growth_table,    "scorecard_growth"),
+        (fig_valuation_table, "scorecard_valuation"),
+        (fig_comparison,      "comparison"),
+        (fig_snapshot,        "snapshot"),
+        (fig_etf,              "etf_overview"),
+        (fig_etf_table,        "etf_table"),
     ]
     for fig, label in pairs:
         if fig is not None:
@@ -1784,7 +1941,6 @@ def open_chart_prefs_dialog(parent):
     BG         = "#F7F9FC"
     ACCENT     = "#00A4EF"
 
-    # ── Header ──────────────────────────────────────────────────────────────
     tk.Label(
         dlg, text="Chart Style Preferences",
         bg=ACCENT, fg="white",
@@ -1800,11 +1956,9 @@ def open_chart_prefs_dialog(parent):
         anchor="w",
     ).pack(fill="x", padx=24, pady=(10, 2))
 
-    # ── Series rows ─────────────────────────────────────────────────────────
     frame = tk.Frame(dlg, bg=BG, padx=24, pady=8)
     frame.pack(fill="x")
 
-    # Column headers
     tk.Label(frame, text="Series", bg=BG, fg="#888",
              font=("Segoe UI", 10), anchor="w").grid(
         row=0, column=0, sticky="w", padx=(0, 16))
@@ -1816,7 +1970,6 @@ def open_chart_prefs_dialog(parent):
     grid_row = 1
 
     for key, (panel_title, series_label) in PANEL_LABELS.items():
-        # Panel group heading row
         if panel_title is not None:
             tk.Label(
                 frame, text=panel_title,
@@ -1827,7 +1980,6 @@ def open_chart_prefs_dialog(parent):
                    pady=(12, 2))
             grid_row += 1
 
-        # Series label
         tk.Label(
             frame, text=f"  {series_label}",
             bg=BG, fg="#1A1A2E",
@@ -1850,10 +2002,8 @@ def open_chart_prefs_dialog(parent):
 
         grid_row += 1
 
-    # ── Separator ───────────────────────────────────────────────────────────
     tk.Frame(dlg, bg="#CCCCCC", height=1).pack(fill="x", padx=24, pady=(8, 0))
 
-    # ── Buttons ─────────────────────────────────────────────────────────────
     btn_row = tk.Frame(dlg, bg=BG, padx=24, pady=14)
     btn_row.pack(fill="x")
 
@@ -1882,7 +2032,6 @@ def open_chart_prefs_dialog(parent):
         command=_cancel,
     ).pack(side="right", padx=(0, 10))
 
-    # Centre over parent
     dlg.update_idletasks()
     px = parent.winfo_x() + (parent.winfo_width()  - dlg.winfo_width())  // 2
     py = parent.winfo_y() + (parent.winfo_height() - dlg.winfo_height()) // 2
@@ -2008,13 +2157,14 @@ def main():
         need_charts   = do_show or do_export
 
         apply_style()
-        chart_prefs       = load_chart_prefs()
-        figs_stock_single = []
-        fig_stock_table   = None
-        fig_comparison    = None
-        fig_snapshot      = None
-        fig_etf           = None
-        fig_etf_table     = None
+        chart_prefs        = load_chart_prefs()
+        figs_stock_single   = []
+        fig_growth_table    = None   # interactive Tk window, not a matplotlib fig — stays None
+        fig_valuation_table = None   # same
+        fig_comparison      = None
+        fig_snapshot        = None
+        fig_etf             = None
+        fig_etf_table       = None   # same — ETF table is also a Tk window
 
         if need_charts:
             for d, col in zip(stock_list, stock_colors):
@@ -2024,8 +2174,10 @@ def main():
                 figs_stock_single.append(fig)
 
             if stock_list:
-                log("  Table: Stock Scorecard")
-                show_stock_table(stock_list, stock_colors, YEARS_BACK)
+                log("  Table: Scorecard — Growth & Quality")
+                show_stock_table_growth(stock_list, stock_colors, YEARS_BACK)
+                log("  Table: Scorecard — Valuation, Balance Sheet & Capital Return")
+                show_stock_table_valuation(stock_list, stock_colors, YEARS_BACK)
 
             if len(stock_list) > 1:
                 log("  Chart: Comparison")
@@ -2043,7 +2195,8 @@ def main():
                 show_etf_table(etf_list, etf_colors, YEARS_BACK)
 
         figs = figs_stock_single[:]
-        for f in [fig_stock_table, fig_comparison, fig_snapshot, fig_etf, fig_etf_table]:
+        for f in [fig_growth_table, fig_valuation_table, fig_comparison,
+                  fig_snapshot, fig_etf, fig_etf_table]:
             if f is not None:
                 figs.append(f)
 
@@ -2052,7 +2205,8 @@ def main():
             saved, session_folder = export_session(
                 stock_list, stock_colors, etf_list, etf_colors,
                 figs_stock_single, fig_comparison, fig_snapshot,
-                fig_etf, fig_etf_table, fig_stock_table, YEARS_BACK,
+                fig_etf, fig_etf_table, fig_growth_table, fig_valuation_table,
+                YEARS_BACK,
             )
             log(f"  \u2714 {len(saved)} files \u2192 {session_folder}")
 
@@ -2074,9 +2228,6 @@ def main():
                     return
             plt.show()
 
-        # Charts closed — wait for Run Again or window close.
-        # _run_again() will update _run_state and call root.quit().
-        # _go() will also call root.quit() after updating _run_state.
         try:
             if _root is not None and _root.winfo_exists():
                 _title_var.set("Done \u2014 run again?")
@@ -2084,7 +2235,6 @@ def main():
         except Exception:
             pass
 
-        # Read whatever _run_again / _go put into the shared state dict
         if not _run_state["selected"]:
             print("No tickers selected. Exiting.")
             sys.exit(0)
