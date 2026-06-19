@@ -24,6 +24,7 @@ from ticker_picker import pick_tickers, post_status
 from interactive_table import (
     show_stock_table_growth, show_stock_table_valuation, show_etf_table
 )
+import app_settings
 import warnings
 warnings.filterwarnings("ignore")
 
@@ -1075,13 +1076,32 @@ STYLE = {
     "patch.edgecolor":   "none",
 }
 
+# ── Chart font scale (Edit ▸ Preferences ▸ Display Settings…) ────────────────
+# Re-read each run so changes made between clicks of "Go" take effect without
+# needing to restart the app. Every explicit fontsize=/labelsize= literal in
+# the plotting code below is wrapped in fs(...) so the whole chart set scales
+# together, the same way the ticker picker and scorecard windows do.
+_CHART_FONT_SCALE = 100.0
+
+def refresh_chart_font_scale():
+    global _CHART_FONT_SCALE
+    _settings = app_settings.load_settings()
+    _CHART_FONT_SCALE = app_settings.get_float(_settings, "chart_font_scale", 100.0)
+    return _CHART_FONT_SCALE
+
+def fs(base_size, minimum=6):
+    """Scale a base matplotlib font size by the user's chart-font preference."""
+    return app_settings.scaled_size(base_size, _CHART_FONT_SCALE, minimum)
+
 def apply_style():
+    refresh_chart_font_scale()
+    STYLE["font.size"] = fs(9)
     plt.rcParams.update(STYLE)
 
 def ticker_legend(ax, data_list, colors):
     handles = [Line2D([0],[0], color=c, linewidth=2, label=d["symbol"])
                for d, c in zip(data_list, colors)]
-    ax.legend(handles=handles, fontsize=8, framealpha=0.9,
+    ax.legend(handles=handles, fontsize=fs(8), framealpha=0.9,
               loc="upper left", ncol=max(1, len(data_list)//5))
 
 
@@ -1133,7 +1153,7 @@ def _draw_panel_table(ax_table, yrs, series_rows):
         loc="center",
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(7)
+    tbl.set_fontsize(fs(7))
     tbl.scale(1.0, 1.3)
 
     for (row_idx, col_idx), cell in tbl.get_celld().items():
@@ -1185,7 +1205,7 @@ def plot_single_ticker(d, color, prefs=None):
     year_range = f"{d['years'][0]}–{d['years'][-1]}" if d.get("years") else ""
     fig = plt.figure(figsize=(16, 11), facecolor="white")   # room for per-panel tables, tightened
     fig.suptitle(f"{d['symbol']} — {d['name']}  |  Fundamentals {year_range}",
-                 fontsize=14, fontweight="bold", y=0.985)
+                 fontsize=fs(14), fontweight="bold", y=0.985)
 
     # Outer 2x3 grid, each cell will itself be split chart/table via
     # _make_panel_gridspec. height_ratios on the outer grid keep all six
@@ -1216,9 +1236,9 @@ def plot_single_ticker(d, color, prefs=None):
     title1 = "Share Price ($)"
     if price_cagr is not None:
         title1 += f"   ·   CAGR {price_cagr:+.1f}%"
-    ax1.set_title(title1, fontsize=10, fontweight="bold")
-    ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=8)
-    ax1.legend(fontsize=7)
+    ax1.set_title(title1, fontsize=fs(10), fontweight="bold")
+    ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax1.legend(fontsize=fs(7))
     add_zero_line(ax1)
     _draw_panel_table(tbl1, yrs, [
         ("Price ($)", color, d["prices"], lambda v: f"${v:,.0f}"),
@@ -1265,12 +1285,12 @@ def plot_single_ticker(d, color, prefs=None):
     title2 = "P/E Ratio & PEG"
     if fwd_pe and avg_pe_5:
         title2 += f"   ·   Fwd/Avg {fwd_pe/avg_pe_5:.2f}x"
-    ax2.set_title(title2, fontsize=10, fontweight="bold")
-    ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=8)
-    ax2.tick_params(axis="y", labelsize=8)
-    ax2b.tick_params(axis="y", labelsize=8, colors="#F59E0B")
-    ax2b.set_ylabel("PEG", fontsize=8, color="#F59E0B")
-    ax2.legend(handles=legend_lines, fontsize=7)
+    ax2.set_title(title2, fontsize=fs(10), fontweight="bold")
+    ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax2.tick_params(axis="y", labelsize=fs(8))
+    ax2b.tick_params(axis="y", labelsize=fs(8), colors="#F59E0B")
+    ax2b.set_ylabel("PEG", fontsize=fs(8), color="#F59E0B")
+    ax2.legend(handles=legend_lines, fontsize=fs(7))
     add_zero_line(ax2)
     _draw_panel_table(tbl2, yrs, [
         ("P/E", color, d["pe"], lambda v: f"{v:.1f}x"),
@@ -1293,18 +1313,18 @@ def plot_single_ticker(d, color, prefs=None):
     title3 = "EPS ($) & ROE (%)"
     if eps_cagr_v is not None:
         title3 += f"   ·   EPS CAGR {eps_cagr_v:+.1f}%"
-    ax3.set_title(title3, fontsize=10, fontweight="bold")
-    ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=8)
-    ax3.tick_params(axis="y", labelsize=8)
-    ax3b.tick_params(axis="y", labelsize=8, colors="#EF4444")
-    ax3b.set_ylabel("ROE %", fontsize=8, color="#EF4444")
+    ax3.set_title(title3, fontsize=fs(10), fontweight="bold")
+    ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax3.tick_params(axis="y", labelsize=fs(8))
+    ax3b.tick_params(axis="y", labelsize=fs(8), colors="#EF4444")
+    ax3b.set_ylabel("ROE %", fontsize=fs(8), color="#EF4444")
     lines3 = [
         Line2D([0],[0], color=color, linewidth=6 if s3_eps=="bar" else 2,
                alpha=0.75 if s3_eps=="bar" else 1.0, label="EPS ($)"),
         Line2D([0],[0], color="#EF4444", linewidth=6 if s3_roe=="bar" else 2,
                alpha=0.75 if s3_roe=="bar" else 1.0, label="ROE (%)"),
     ]
-    ax3.legend(handles=lines3, fontsize=7)
+    ax3.legend(handles=lines3, fontsize=fs(7))
     add_zero_line(ax3)
     _draw_panel_table(tbl3, yrs, [
         ("EPS ($)", color, d["eps"], lambda v: f"${v:.2f}"),
@@ -1328,18 +1348,18 @@ def plot_single_ticker(d, color, prefs=None):
     title4 = "Book Value/Share & Debt/Assets"
     if bvps_cagr is not None:
         title4 += f"   ·   BVPS CAGR {bvps_cagr:+.1f}%"
-    ax4.set_title(title4, fontsize=10, fontweight="bold")
-    ax4.set_xticks(x[::2]); ax4.set_xticklabels(yrs[::2], fontsize=8)
-    ax4.tick_params(axis="y", labelsize=8)
-    ax4b.tick_params(axis="y", labelsize=8, colors="#06B6D4")
-    ax4b.set_ylabel("Debt/Assets %", fontsize=8, color="#06B6D4")
+    ax4.set_title(title4, fontsize=fs(10), fontweight="bold")
+    ax4.set_xticks(x[::2]); ax4.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax4.tick_params(axis="y", labelsize=fs(8))
+    ax4b.tick_params(axis="y", labelsize=fs(8), colors="#06B6D4")
+    ax4b.set_ylabel("Debt/Assets %", fontsize=fs(8), color="#06B6D4")
     lines4 = [
         Line2D([0],[0], color=color, linewidth=6 if s4_bvps=="bar" else 2,
                alpha=0.75 if s4_bvps=="bar" else 1.0, label="BV/Sh ($)"),
         Line2D([0],[0], color="#06B6D4", linewidth=6 if s4_debt=="bar" else 2,
                alpha=0.75 if s4_debt=="bar" else 1.0, label="Debt/Assets (%)"),
     ]
-    ax4.legend(handles=lines4, fontsize=7)
+    ax4.legend(handles=lines4, fontsize=fs(7))
     add_zero_line(ax4)
     _draw_panel_table(tbl4, yrs, [
         ("BV/Sh ($)", color, d["bvps"], lambda v: f"${v:.2f}"),
@@ -1357,10 +1377,10 @@ def plot_single_ticker(d, color, prefs=None):
     title5 = "OCF/Share & FCF/Share ($)"
     if fcf_cagr is not None:
         title5 += f"   ·   FCF CAGR {fcf_cagr:+.1f}%"
-    ax5.set_title(title5, fontsize=10, fontweight="bold")
-    ax5.set_xticks(x[::2]); ax5.set_xticklabels(yrs[::2], fontsize=8)
-    ax5.tick_params(axis="y", labelsize=8)
-    ax5.legend(fontsize=7)
+    ax5.set_title(title5, fontsize=fs(10), fontweight="bold")
+    ax5.set_xticks(x[::2]); ax5.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax5.tick_params(axis="y", labelsize=fs(8))
+    ax5.legend(fontsize=fs(7))
     add_zero_line(ax5)
     _draw_panel_table(tbl5, yrs, [
         ("OCF/Sh ($)", color, d["ocfps"], lambda v: f"${v:.2f}"),
@@ -1381,21 +1401,21 @@ def plot_single_ticker(d, color, prefs=None):
     has_divs = any(v and v > 0 for v in d["divps"])
     if has_divs:
         _draw_series(ax6b, yrs, x, d["divps"], s6_div, "#7C3AED", alpha=0.80, label="Div/Sh ($)", marker="D")
-        ax6b.tick_params(axis="y", labelsize=8, colors="#8B5CF6")
-        ax6b.set_ylabel("Div/Sh ($)", fontsize=8, color="#8B5CF6")
+        ax6b.tick_params(axis="y", labelsize=fs(8), colors="#8B5CF6")
+        ax6b.set_ylabel("Div/Sh ($)", fontsize=fs(8), color="#8B5CF6")
     title6 = "Revenue/Share & Div/Share ($)"
     if rev_cagr is not None:
         title6 += f"   ·   Rev/Sh CAGR {rev_cagr:+.1f}%"
-    ax6.set_title(title6, fontsize=10, fontweight="bold")
-    ax6.set_xticks(x[::2]); ax6.set_xticklabels(yrs[::2], fontsize=8)
-    ax6.tick_params(axis="y", labelsize=8)
+    ax6.set_title(title6, fontsize=fs(10), fontweight="bold")
+    ax6.set_xticks(x[::2]); ax6.set_xticklabels(yrs[::2], fontsize=fs(8))
+    ax6.tick_params(axis="y", labelsize=fs(8))
     lines6 = [
         Line2D([0],[0], color=color, linewidth=6 if s6_rev=="bar" else 2,
                alpha=0.75 if s6_rev=="bar" else 1.0, label="Rev/Sh ($)"),
         Line2D([0],[0], color="#8B5CF6", linewidth=6 if s6_div=="bar" else 2,
                alpha=0.75 if s6_div=="bar" else 1.0, label="Div/Sh ($)"),
     ]
-    ax6.legend(handles=lines6, fontsize=7)
+    ax6.legend(handles=lines6, fontsize=fs(7))
     add_zero_line(ax6)
     table6_rows = [("Rev/Sh ($)", color, d["revps"], lambda v: f"${v:.2f}")]
     if has_divs:
@@ -1410,7 +1430,7 @@ def plot_single_ticker(d, color, prefs=None):
     peg_str = f"  PEG {cur_peg:.2f}" if cur_peg else ""
     fig.text(0.5, 0.035,
              f"Analyst Consensus: {consensus_str}{tp_str}{low_str}{hi_str}{peg_str}",
-             ha="center", fontsize=9, color="#555", fontfamily="monospace")
+             ha="center", fontsize=fs(9), color="#555", fontfamily="monospace")
 
     summary_parts = []
     if rev_cagr is not None:
@@ -1425,7 +1445,7 @@ def plot_single_ticker(d, color, prefs=None):
         summary_parts.append(f"Fwd PE vs Hist: {fwd_pe/avg_pe_5:.2f}x")
     if summary_parts:
         fig.text(0.5, 0.012, "  |  ".join(summary_parts),
-                 ha="center", fontsize=9, fontweight="bold",
+                 ha="center", fontsize=fs(9), fontweight="bold",
                  color="#1A1A2E", fontfamily="monospace")
 
     for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
@@ -1441,7 +1461,7 @@ def plot_comparison(data_list, colors):
     apply_style()
     fig, axes = plt.subplots(3, 3, figsize=(18, 14), facecolor="white")
     fig.suptitle("All Tickers — Side-by-Side Comparison",
-                 fontsize=14, fontweight="bold", y=0.99)
+                 fontsize=fs(14), fontweight="bold", y=0.99)
 
     base_years = data_list[0]["years"]
     yrs = year_labels(base_years)
@@ -1473,9 +1493,9 @@ def plot_comparison(data_list, colors):
                     vals.append(None)
             ax.plot(yrs, clean(vals), color=col, linewidth=1.8,
                     marker="o", markersize=3, label=d["symbol"])
-        ax.set_title(title, fontsize=10, fontweight="bold")
-        ax.set_xticks(x[::2]); ax.set_xticklabels(yrs[::2], fontsize=8, rotation=30)
-        ax.tick_params(axis="y", labelsize=8)
+        ax.set_title(title, fontsize=fs(10), fontweight="bold")
+        ax.set_xticks(x[::2]); ax.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
+        ax.tick_params(axis="y", labelsize=fs(8))
         add_zero_line(ax)
         ticker_legend(ax, data_list, colors)
 
@@ -1505,7 +1525,7 @@ def plot_snapshot(data_list, colors):
 
     fig, axes = plt.subplots(2, 4, figsize=(18, 9), facecolor="white")
     fig.suptitle("Latest Year — All Tickers Snapshot",
-                 fontsize=14, fontweight="bold", y=1.00)
+                 fontsize=fs(14), fontweight="bold", y=1.00)
 
     syms = [d["symbol"] for d in data_list]
     x    = np.arange(len(syms))
@@ -1523,9 +1543,9 @@ def plot_snapshot(data_list, colors):
         vals_plot = [0 if np.isnan(v) else v for v in vals]
         ax.bar(x, vals_plot, color=bar_colors, alpha=1.0, width=0.6, linewidth=0, edgecolor="none")
         ax.set_xticks(x)
-        ax.set_xticklabels(syms, fontsize=11, fontweight="bold", rotation=45, ha="right")
-        ax.set_title(title, fontsize=10, fontweight="bold")
-        ax.tick_params(axis="y", labelsize=8)
+        ax.set_xticklabels(syms, fontsize=fs(11), fontweight="bold", rotation=45, ha="right")
+        ax.set_title(title, fontsize=fs(10), fontweight="bold")
+        ax.tick_params(axis="y", labelsize=fs(8))
         add_zero_line(ax)
         ax.grid(False)
 
@@ -1535,7 +1555,7 @@ def plot_snapshot(data_list, colors):
             label = f"{v:.1f}" if abs(v) < 1000 else f"{v/1000:.1f}k"
             ax.text(xi, v + (max(vals_plot) * 0.02 if v >= 0 else min(vals_plot) * 0.02),
                     label, ha="center", va="bottom" if v >= 0 else "top",
-                    fontsize=11, fontweight="bold", fontfamily="monospace")
+                    fontsize=fs(11), fontweight="bold", fontfamily="monospace")
 
     plt.tight_layout()
     for ax in fig.axes:
@@ -1559,7 +1579,7 @@ def plot_etf(etf_list, colors, years_back):
 
     fig = plt.figure(figsize=(18, 10), facecolor="white")
     fig.suptitle("ETF Overview — Price, Distributions & Annual Return",
-                 fontsize=14, fontweight="bold", y=0.98)
+                 fontsize=fs(14), fontweight="bold", y=0.98)
 
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.35)
 
@@ -1581,8 +1601,8 @@ def plot_etf(etf_list, colors, years_back):
                 vals.append(None)
         ax0.plot(yrs, clean(vals), color=col, linewidth=2,
                  marker="o", markersize=4, label=d["symbol"])
-    ax0.set_title("Price ($)", fontsize=10, fontweight="bold")
-    ax0.set_xticks(x[::2]); ax0.set_xticklabels(yrs[::2], fontsize=8, rotation=30)
+    ax0.set_title("Price ($)", fontsize=fs(10), fontweight="bold")
+    ax0.set_xticks(x[::2]); ax0.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
     ticker_legend(ax0, etf_list, colors)
     add_zero_line(ax0)
 
@@ -1595,8 +1615,8 @@ def plot_etf(etf_list, colors, years_back):
                 vals.append(None)
         ax1.plot(yrs, clean(vals), color=col, linewidth=2,
                  marker="o", markersize=4, label=d["symbol"])
-    ax1.set_title("Annual Return (%)", fontsize=10, fontweight="bold")
-    ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=8, rotation=30)
+    ax1.set_title("Annual Return (%)", fontsize=fs(10), fontweight="bold")
+    ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
     ticker_legend(ax1, etf_list, colors)
     add_zero_line(ax1)
 
@@ -1611,8 +1631,8 @@ def plot_etf(etf_list, colors, years_back):
         offset = (idx - n / 2 + 0.5) * width
         ax2.bar(x + offset, vals, width=width, color=col,
                 alpha=0.85, label=d["symbol"], linewidth=0)
-    ax2.set_title("Annual Distributions ($)", fontsize=10, fontweight="bold")
-    ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=8, rotation=30)
+    ax2.set_title("Annual Distributions ($)", fontsize=fs(10), fontweight="bold")
+    ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
     ax2.grid(False)
     ticker_legend(ax2, etf_list, colors)
     add_zero_line(ax2)
@@ -1637,8 +1657,8 @@ def plot_etf(etf_list, colors, years_back):
                  marker="o", markersize=4, label=d["symbol"])
 
     ax3.axhline(100, color="#ccc", linewidth=0.8, linestyle="--", zorder=0)
-    ax3.set_title("Cumulative Total Return (Base = 100)", fontsize=10, fontweight="bold")
-    ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=8, rotation=30)
+    ax3.set_title("Cumulative Total Return (Base = 100)", fontsize=fs(10), fontweight="bold")
+    ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
     ticker_legend(ax3, etf_list, colors)
 
     plt.tight_layout(rect=[0, 0, 1, 0.96])

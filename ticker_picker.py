@@ -20,6 +20,8 @@ import urllib.parse
 import json
 import threading
 
+import app_settings
+
 
 CLR_ACCENT  = "#00A4EF"
 CLR_BG      = "#F7F9FC"
@@ -36,7 +38,7 @@ WINDOW_WIDTH   = 1600
 WINDOW_HEIGHT  = 0.2
 WINDOW_X       = 50
 WINDOW_Y       = 0
-YEARS_DEFAULT  = 5
+YEARS_DEFAULT  = 5   # fallback only — actual default comes from app_settings (Edit ▸ Preferences ▸ Display Settings…)
 
 MONO_FONT_SIZE = 12
 BOLD_FONT_SIZE = 12
@@ -201,6 +203,207 @@ def _parse_bulk(raw: str) -> list[str]:
     return result
 
 
+# ── Display Settings dialog (font sizes + default years back) ───────────────
+
+def open_display_settings_dialog(parent, picker_fonts=None, dialog_state=None):
+    """
+    Open a Toplevel window for editing app-wide display preferences:
+    font size (as a % scale) for the Ticker Picker, Scorecard tables, and
+    Charts, plus the default "years of history" value.
+
+    picker_fonts  : dict of {name: tkfont.Font} for THIS window's own
+                    widgets — changes apply instantly since these are live
+                    named-font objects shared by every widget that uses them.
+    dialog_state  : dict that may hold a "years_var" StringVar so the
+                    History entry box updates immediately too.
+    """
+    settings = app_settings.load_settings()
+    picker_fonts = picker_fonts or {}
+    dialog_state = dialog_state or {}
+
+    dlg = tk.Toplevel(parent)
+    dlg.title("Display Settings")
+    dlg.configure(bg=CLR_BG)
+    dlg.resizable(False, False)
+    dlg.grab_set()  # modal
+
+    FONT_HDR  = ("Segoe UI", 14, "bold")
+    FONT_LBL  = ("Segoe UI", 11, "bold")
+    FONT_PCT  = ("Segoe UI", 11)
+    FONT_NOTE = ("Segoe UI", 10)
+    FONT_BTN  = ("Segoe UI", 11, "bold")
+
+    tk.Label(
+        dlg, text="Display Settings",
+        bg=CLR_ACCENT, fg="white",
+        font=FONT_HDR, padx=24, pady=14,
+    ).pack(fill="x")
+
+    tk.Label(
+        dlg,
+        text="  Font size applies as a percentage of the normal size.",
+        bg=CLR_BG, fg=CLR_SUBTEXT, font=FONT_NOTE, anchor="w",
+    ).pack(fill="x", padx=24, pady=(10, 2))
+
+    body = tk.Frame(dlg, bg=CLR_BG, padx=24, pady=6)
+    body.pack(fill="x")
+
+    scale_vars     = {}
+    entry_vars     = {}   # key -> the StringVar shown in each editable box
+    _entry_commits = []   # callables that push a typed entry value into its IntVar
+
+    def _add_slider(row, label, key, note=None):
+        tk.Label(body, text=label, bg=CLR_BG, fg=CLR_TEXT,
+                 font=FONT_LBL, anchor="w").grid(
+            row=row, column=0, sticky="w", pady=(10, 0))
+
+        var = tk.IntVar(value=int(round(app_settings.get_float(settings, key, 100.0))))
+        scale_vars[key] = var
+
+        entry_var = tk.StringVar(value=str(var.get()))
+        entry_vars[key] = entry_var
+
+        def _clamp(v):
+            return max(app_settings.SCALE_MIN, min(app_settings.SCALE_MAX, v))
+
+        # Slider moved → mirror the (already-clamped) value into the entry box.
+        def _on_slide(_v, var=var, entry_var=entry_var):
+            entry_var.set(str(var.get()))
+
+        # Entry edited (Enter / clicking away) → sanitize, clamp, push to the
+        # slider/IntVar, and write the cleaned-up value back into the box.
+        def _commit_entry(_evt=None, var=var, entry_var=entry_var):
+            digits = "".join(ch for ch in entry_var.get() if ch.isdigit())
+            if not digits:
+                entry_var.set(str(var.get()))   # nothing usable — revert
+                return
+            value = _clamp(int(digits))
+            var.set(value)
+            entry_var.set(str(value))
+
+        slider = tk.Scale(
+            body, from_=app_settings.SCALE_MIN, to=app_settings.SCALE_MAX,
+            orient="horizontal", resolution=1, variable=var,
+            length=240, showvalue=False, bg=CLR_BG,
+            highlightthickness=0, troughcolor="#D8E6F2",
+            command=_on_slide,
+        )
+        slider.grid(row=row, column=1, padx=(12, 0), pady=(10, 0))
+
+        pct_entry = tk.Entry(
+            body, textvariable=entry_var, font=FONT_PCT,
+            width=4, justify="right", relief="flat",
+            highlightthickness=1, highlightcolor=CLR_ACCENT,
+            highlightbackground="#CCCCCC",
+        )
+        pct_entry.grid(row=row, column=2, sticky="w", padx=(8, 2), pady=(10, 0))
+        pct_entry.bind("<Return>", _commit_entry)
+        pct_entry.bind("<FocusOut>", _commit_entry)
+        _entry_commits.append(_commit_entry)  # also called explicitly on Save —
+                                               # clicking Save doesn't reliably
+                                               # fire FocusOut on the entry first
+
+        tk.Label(body, text="%", bg=CLR_BG, fg=CLR_ACCENT,
+                 font=FONT_PCT).grid(row=row, column=3, sticky="w", pady=(10, 0))
+
+        if note:
+            tk.Label(body, text=note, bg=CLR_BG, fg=CLR_SUBTEXT,
+                      font=FONT_NOTE, anchor="w").grid(
+                row=row + 1, column=0, columnspan=4, sticky="w")
+
+    _add_slider(0, "Ticker Picker", "picker_font_scale",
+                note="  Applies immediately to this window.")
+    _add_slider(2, "Scorecard Tables", "scorecard_font_scale",
+                note="  Applies the next time you click Go.")
+    _add_slider(4, "Charts", "chart_font_scale",
+                note="  Applies the next time you click Go.")
+
+    tk.Frame(dlg, bg="#CCCCCC", height=1).pack(fill="x", padx=24, pady=(14, 0))
+
+    yrs_row = tk.Frame(dlg, bg=CLR_BG, padx=24, pady=14)
+    yrs_row.pack(fill="x")
+    tk.Label(yrs_row, text="Default years of history:", bg=CLR_BG,
+             fg=CLR_TEXT, font=FONT_LBL).pack(side="left", padx=(0, 8))
+    years_var = tk.StringVar(value=str(app_settings.get_int(settings, "default_years_back", 5)))
+    tk.Entry(yrs_row, textvariable=years_var, font=FONT_PCT,
+             width=4, relief="flat",
+             highlightthickness=1,
+             highlightcolor=CLR_ACCENT,
+             highlightbackground="#CCCCCC").pack(side="left")
+    tk.Label(yrs_row, text="yrs  (pre-filled in the History box)", bg=CLR_BG,
+             fg=CLR_SUBTEXT, font=FONT_NOTE).pack(side="left", padx=(6, 0))
+
+    tk.Frame(dlg, bg="#CCCCCC", height=1).pack(fill="x", padx=24)
+
+    btn_row = tk.Frame(dlg, bg=CLR_BG, padx=24, pady=14)
+    btn_row.pack(fill="x")
+
+    def _reset():
+        for key, var in scale_vars.items():
+            var.set(100)
+            entry_vars[key].set("100")
+        years_var.set(app_settings.DEFAULTS["default_years_back"])
+
+    def _save():
+        # Force any value the user typed (but never hit Enter / tabbed
+        # away from) into its IntVar before we read scale_vars below.
+        for commit in _entry_commits:
+            commit()
+
+        updated = {k: v.get() for k, v in scale_vars.items()}
+        try:
+            updated["default_years_back"] = max(1, int(years_var.get()))
+        except ValueError:
+            updated["default_years_back"] = app_settings.DEFAULTS["default_years_back"]
+        app_settings.save_settings(updated)
+
+        # Live-update this window's own fonts (named tkfont.Font objects —
+        # every widget using them resizes instantly, no restart needed).
+        new_scale = updated.get("picker_font_scale", 100)
+        base_sizes = {
+            "mono": MONO_FONT_SIZE, "bold": BOLD_FONT_SIZE,
+            "hdr_bold": HDR_BOLD_FONT_SIZE, "hdr_sub": HDR_SUB_FONT_SIZE,
+            "sel_font": SEL_FONT_SIZE, "tick_font": TICK_FONT_SIZE,
+            "menu_font": BOLD_FONT_SIZE,
+        }
+        for name, font_obj in picker_fonts.items():
+            base = base_sizes.get(name, MONO_FONT_SIZE)
+            font_obj.configure(size=app_settings.scaled_size(base, new_scale))
+
+        yv = dialog_state.get("years_var")
+        if yv is not None:
+            yv.set(str(updated["default_years_back"]))
+
+        dlg.destroy()
+
+    def _cancel():
+        dlg.destroy()
+
+    tk.Button(
+        btn_row, text="✓  Save", bg=CLR_ACCENT, fg="white",
+        font=FONT_BTN, relief="flat", padx=20, pady=8, cursor="hand2",
+        command=_save,
+    ).pack(side="right")
+
+    tk.Button(
+        btn_row, text="Cancel", bg="#E5E7EB", fg=CLR_TEXT,
+        font=FONT_BTN, relief="flat", padx=16, pady=8, cursor="hand2",
+        command=_cancel,
+    ).pack(side="right", padx=(0, 10))
+
+    tk.Button(
+        btn_row, text="Reset to Defaults", bg="#E5E7EB", fg=CLR_TEXT,
+        font=FONT_BTN, relief="flat", padx=16, pady=8, cursor="hand2",
+        command=_reset,
+    ).pack(side="left")
+
+    dlg.update_idletasks()
+    px = parent.winfo_x() + (parent.winfo_width()  - dlg.winfo_width())  // 2
+    py = parent.winfo_y() + (parent.winfo_height() - dlg.winfo_height()) // 2
+    dlg.geometry(f"+{px}+{py}")
+    dlg.wait_window()
+
+
 def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> tuple[list[str], int, bool, bool]:
     available: list[tuple[str, str]] = []
 
@@ -221,7 +424,10 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
 
     # ── Result holders ────────────────────────────────────────────────────
     result_tickers: list[str] = []
-    result_years:   int       = YEARS_DEFAULT
+    _display_settings = app_settings.load_settings()
+    _picker_scale      = app_settings.get_float(_display_settings, "picker_font_scale", 100.0)
+    _years_default     = app_settings.get_int(_display_settings, "default_years_back", YEARS_DEFAULT)
+    result_years:   int       = _years_default
     result_refresh: bool      = False
     result_export:  bool      = False
 
@@ -282,20 +488,30 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
    # print(f"[DEBUG GEOM] actual root size: {root.winfo_width()}x{root.winfo_height()} at ({root.winfo_x()},{root.winfo_y()})")
     root.minsize(500, 400)
 
-    mono      = tkfont.Font(family="Consolas", size=MONO_FONT_SIZE)
-    bold      = tkfont.Font(family="Consolas", size=BOLD_FONT_SIZE, weight="bold")
-    hdr_bold  = tkfont.Font(family="Consolas", size=HDR_BOLD_FONT_SIZE, weight="bold")
-    hdr_sub   = tkfont.Font(family="Consolas", size=HDR_SUB_FONT_SIZE)
-    sel_font  = tkfont.Font(family="Consolas", size=SEL_FONT_SIZE, weight="bold")
-    tick_font = tkfont.Font(family="Segoe UI Symbol", size=TICK_FONT_SIZE)
+    mono      = tkfont.Font(family="Consolas", size=app_settings.scaled_size(MONO_FONT_SIZE, _picker_scale))
+    bold      = tkfont.Font(family="Consolas", size=app_settings.scaled_size(BOLD_FONT_SIZE, _picker_scale), weight="bold")
+    hdr_bold  = tkfont.Font(family="Consolas", size=app_settings.scaled_size(HDR_BOLD_FONT_SIZE, _picker_scale), weight="bold")
+    hdr_sub   = tkfont.Font(family="Consolas", size=app_settings.scaled_size(HDR_SUB_FONT_SIZE, _picker_scale))
+    sel_font  = tkfont.Font(family="Consolas", size=app_settings.scaled_size(SEL_FONT_SIZE, _picker_scale), weight="bold")
+    tick_font = tkfont.Font(family="Segoe UI Symbol", size=app_settings.scaled_size(TICK_FONT_SIZE, _picker_scale))
 
     # ── Menubar ───────────────────────────────────────────────────────────
-    menu_font = tkfont.Font(family="Consolas", size=BOLD_FONT_SIZE, weight="bold")
+    menu_font = tkfont.Font(family="Consolas", size=app_settings.scaled_size(BOLD_FONT_SIZE, _picker_scale), weight="bold")
     menubar = tk.Menu(root, font=menu_font)
 
     file_menu = tk.Menu(menubar, tearoff=0, font=menu_font)
     file_menu.add_command(label="Exit", command=lambda: root.destroy())
     menubar.add_cascade(label="File", menu=file_menu)
+
+    # Named fonts above are live tkfont.Font objects — every widget that was
+    # built with font=<one of these> will resize instantly when we later
+    # call .configure(size=...) on them from the Display Settings dialog.
+    _picker_fonts = {
+        "mono": mono, "bold": bold, "hdr_bold": hdr_bold,
+        "hdr_sub": hdr_sub, "sel_font": sel_font,
+        "tick_font": tick_font, "menu_font": menu_font,
+    }
+    _dialog_state = {"years_var": None}  # filled in once years_var exists below
 
     edit_menu  = tk.Menu(menubar, tearoff=0, font=menu_font)
     prefs_menu = tk.Menu(edit_menu, tearoff=0, font=menu_font)
@@ -306,6 +522,10 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         )
     else:
         prefs_menu.add_command(label="Chart Preferences…", state="disabled")
+    prefs_menu.add_command(
+        label="Display Settings…",
+        command=lambda: open_display_settings_dialog(root, _picker_fonts, _dialog_state),
+    )
     edit_menu.add_cascade(label="Preferences", menu=prefs_menu)
     menubar.add_cascade(label="Edit", menu=edit_menu)
 
@@ -1743,7 +1963,8 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     years_frame.pack(side="left", padx=(0, 14))
     tk.Label(years_frame, text="History:", bg=CLR_BG,
              fg=CLR_SUBTEXT, font=bold).pack(side="left", padx=(0, 6))
-    years_var = tk.StringVar(value=str(YEARS_DEFAULT))
+    years_var = tk.StringVar(value=str(_years_default))
+    _dialog_state["years_var"] = years_var
     tk.Entry(years_frame, textvariable=years_var, font=mono,
              width=4, relief="flat",
              highlightthickness=1,
@@ -1762,7 +1983,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         try:
             result_years = max(1, int(years_var.get()))
         except ValueError:
-            result_years = YEARS_DEFAULT
+            result_years = _years_default
         result_refresh = refresh_var.get()
         result_export  = export_var.get()
 
@@ -1938,8 +2159,11 @@ def post_status(log_text, status_title_var, message, title=None):
 # ── Manual entry fallback (no DB) ─────────────────────────────────────────────
 
 def _manual_entry_fallback() -> tuple[list[str], int, bool, bool]:
+    _settings = app_settings.load_settings()
+    _years_default = app_settings.get_int(_settings, "default_years_back", YEARS_DEFAULT)
+    _scale = app_settings.get_float(_settings, "picker_font_scale", 100.0)
     result_tickers: list[str] = []
-    result_years:   int       = YEARS_DEFAULT
+    result_years:   int       = _years_default
 
     root = tk.Tk()
     root.title("Enter Tickers")
@@ -1948,8 +2172,8 @@ def _manual_entry_fallback() -> tuple[list[str], int, bool, bool]:
     root.geometry("440x220")
     root.eval("tk::PlaceWindow . center")
 
-    mono = tkfont.Font(family="Consolas", size=11)
-    bold = tkfont.Font(family="Consolas", size=11, weight="bold")
+    mono = tkfont.Font(family="Consolas", size=app_settings.scaled_size(11, _scale))
+    bold = tkfont.Font(family="Consolas", size=app_settings.scaled_size(11, _scale), weight="bold")
 
     tk.Label(root,
              text="No saved tickers found.\nEnter symbols separated by commas:",
@@ -1967,7 +2191,7 @@ def _manual_entry_fallback() -> tuple[list[str], int, bool, bool]:
     yf = tk.Frame(root, bg=CLR_BG)
     yf.pack(pady=6)
     tk.Label(yf, text="History:", bg=CLR_BG, fg=CLR_TEXT, font=bold).pack(side="left", padx=(0, 6))
-    years_var = tk.StringVar(value=str(YEARS_DEFAULT))
+    years_var = tk.StringVar(value=str(_years_default))
     tk.Entry(yf, textvariable=years_var, font=mono,
              width=4, relief="flat",
              highlightthickness=1,
@@ -1983,7 +2207,7 @@ def _manual_entry_fallback() -> tuple[list[str], int, bool, bool]:
         try:
             result_years = max(1, int(years_var.get()))
         except ValueError:
-            result_years = YEARS_DEFAULT
+            result_years = _years_default
         root.destroy()
 
     tk.Button(root, text="▶  Go", bg=CLR_ACCENT, fg="white",
