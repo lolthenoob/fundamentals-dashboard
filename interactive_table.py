@@ -20,6 +20,8 @@ import tkinter as tk
 from tkinter import ttk, font as tkfont
 import numpy as np
 
+import app_settings
+
 
 # ── Palette — matches ticker_picker / main.py ─────────────────────────────────
 CLR_ACCENT   = "#00A4EF"
@@ -163,9 +165,15 @@ class SortableTable:
         self.root.configure(bg=CLR_BG)
         self.root.resizable(True, True)
 
-        mono      = tkfont.Font(family="Consolas", size=12)
-        hdr_bold  = tkfont.Font(family="Consolas", size=16, weight="bold")
-        hdr_sub   = tkfont.Font(family="Consolas", size=12)
+        _settings = app_settings.load_settings()
+        _scale = app_settings.get_float(_settings, "scorecard_font_scale", 100.0)
+
+        def _sz(base, minimum=6):
+            return app_settings.scaled_size(base, _scale, minimum)
+
+        mono      = tkfont.Font(family="Consolas", size=_sz(12))
+        hdr_bold  = tkfont.Font(family="Consolas", size=_sz(16), weight="bold")
+        hdr_sub   = tkfont.Font(family="Consolas", size=_sz(12))
 
         hdr = tk.Frame(self.root, bg=CLR_ACCENT, pady=10)
         hdr.pack(fill="x")
@@ -194,15 +202,25 @@ class SortableTable:
         vsb.config(command=self.tv.yview)
         hsb.config(command=self.tv.xview)
 
+        # Column width is measured from the actual heading font, not guessed
+        # from character count — a char-count guess undershoots on wider
+        # glyphs/longer headings and causes adjacent headers to visually
+        # run into each other once columns no longer stretch to compensate.
+        scaled_min_w  = _sz(min_col_w, minimum=40)
+        ticker_col_w  = _sz(100, minimum=50)
+        heading_font  = tkfont.Font(family="Consolas", size=_sz(11), weight="bold")
+        col_padding   = _sz(24, minimum=12)  # breathing room each side of text
+
         self.tv.heading("#0", text="Ticker",
                         command=lambda: self._sort_by("#0"))
-        self.tv.column("#0", width=100, minwidth=80, stretch=False, anchor="center")
+        self.tv.column("#0", width=ticker_col_w, minwidth=50, stretch=False, anchor="center")
 
         for col, hd in zip(columns, headings):
             self.tv.heading(col, text=hd,
                             command=lambda c=col: self._sort_by(c))
-            self.tv.column(col, width=max(min_col_w, len(hd) * 11),
-                           minwidth=80, anchor="center")
+            text_w = heading_font.measure(hd) + col_padding
+            self.tv.column(col, width=max(scaled_min_w, text_w),
+                           minwidth=50, anchor="center", stretch=False)
 
         style = ttk.Style()
         style.theme_use("default")
@@ -210,12 +228,12 @@ class SortableTable:
                         background=CLR_ROW_A,
                         fieldbackground=CLR_ROW_A,
                         foreground=CLR_TEXT,
-                        font=("Consolas", 15),
-                        rowheight=44)
+                        font=("Consolas", _sz(11)),
+                        rowheight=_sz(44, minimum=18))
         style.configure("Treeview.Heading",
                         background=CLR_HDR_BG,
                         foreground=CLR_TEXT,
-                        font=("Consolas", 15, "bold"),
+                        font=("Consolas", _sz(11), "bold"),
                         relief="flat")
         style.map("Treeview.Heading",
                   background=[("active", CLR_ACCENT)],
@@ -227,12 +245,18 @@ class SortableTable:
         self.tv.tag_configure("odd",  background=CLR_ROW_A)
         self.tv.tag_configure("even", background=CLR_ROW_B)
 
+        # Shift+wheel for horizontal scroll (vertical wheel-scroll already
+        # works natively on Treeview).
+        def _on_shift_wheel(event):
+            self.tv.xview_scroll(-1 if event.delta > 0 else 1, "units")
+        self.tv.bind("<Shift-MouseWheel>", _on_shift_wheel)
+
         self._populate(self.rows, self.row_labels)
 
         self._status_var = tk.StringVar(value=f"{len(rows)} rows")
         tk.Label(self.root, textvariable=self._status_var,
                  bg=CLR_BG, fg=CLR_SUBTEXT,
-                 font=("Consolas", 13), anchor="w",
+                 font=("Consolas", _sz(11)), anchor="w",
                  padx=14).pack(fill="x", pady=(0, 6))
 
     def _populate(self, rows, row_labels):

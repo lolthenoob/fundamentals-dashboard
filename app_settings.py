@@ -30,7 +30,7 @@ DEFAULTS = {
     "picker_font_scale":    "100",   # %
     "scorecard_font_scale": "100",   # %
     "chart_font_scale":     "100",   # %
-    "default_years_back":   "5",
+    "default_years_back":   "4",
 }
 
 # Slider range used by the Display Settings dialog

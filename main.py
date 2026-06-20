@@ -44,7 +44,6 @@ import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
 import yfinance as yf
 from datetime import datetime
-import mplcursors
 
 
 # ── Colour palette (cycles if more tickers than colours) ─────────────────────
@@ -875,7 +874,7 @@ def download_etf(symbol, years_back):
     try:
         t    = yf.Ticker(symbol)
         info = t.info
-        hist = t.history(period="max", interval="1mo")
+        hist = t.history(period="max", interval="1mo", auto_adjust=True)
         divs = t.dividends
 
         if hist.empty:
@@ -999,14 +998,57 @@ def cagr_full_window(values, years_list):
     This is the "always start of search window to end" version used for
     chart panel headlines and the footer summary line, since those should
     describe exactly what's plotted on screen.
+
+    Three cases:
+    - start & end both positive: standard CAGR.
+    - start & end both negative: sign-aware magnitude CAGR (negative =
+      got worse / more negative, positive = improved / less negative).
+    - sign crossed zero (start neg, end pos, or vice versa): standard
+      CAGR is undefined here (no real rate solves it), so this uses a
+      fixed, deterministic shift — every value in the window is shifted
+      up by (abs(min value in window) + 1) so the whole series becomes
+      positive, then standard CAGR runs on the shifted series. The shift
+      amount is derived from the data itself (not a free parameter you'd
+      have to pick by hand), so the same series always gets the same
+      shift and the same answer. This number is NOT a true compound
+      growth rate (compounding it won't reproduce the original values —
+      shifting breaks that property for negative-crossing data, there is
+      no way around that), but it reliably reads positive when the
+      metric is improving and negative when it's worsening, which is
+      what this is actually used for on this chart.
     """
-    pairs = [(y, v) for y, v in zip(years_list, values) if v is not None and v > 0]
+    pairs = [(y, v) for y, v in zip(years_list, values) if v is not None]
     if len(pairs) < 2:
         return None
     n = pairs[-1][0] - pairs[0][0]
     if n <= 0:
         return None
-    return round(((pairs[-1][1] / pairs[0][1]) ** (1 / n) - 1) * 100, 1)
+
+    start, end = pairs[0][1], pairs[-1][1]
+    if start == 0 or end == 0:
+        return None  # can't compute a meaningful rate from/to exactly zero
+
+    if start > 0 and end > 0:
+        return round(((end / start) ** (1 / n) - 1) * 100, 1)
+
+    if start < 0 and end < 0:
+        # Sign-aware magnitude CAGR: the raw rate of |value| growth is
+        # positive when the magnitude is growing (i.e. getting further
+        # from zero / worse) and negative when shrinking (improving).
+        # Negate it so the sign reads the way these stats normally do:
+        # negative = worsening, positive = improving.
+        mag_rate = ((abs(end) / abs(start)) ** (1 / n) - 1) * 100
+        return round(-mag_rate, 1)
+
+    # Crossed zero (start and end have opposite signs). Shift the whole
+    # window up by a fixed, data-derived amount so start/end both become
+    # positive, then run standard CAGR on the shifted pair.
+    all_vals = [v for _, v in pairs]
+    shift = abs(min(all_vals)) + 1
+    shifted_start, shifted_end = start + shift, end + shift
+    if shifted_start <= 0:  # guard, shouldn't trigger given the +1 above
+        return None
+    return round(((shifted_end / shifted_start) ** (1 / n) - 1) * 100, 1)
 
 
 def margin_trend(margin_list):
@@ -1092,6 +1134,23 @@ def refresh_chart_font_scale():
 def fs(base_size, minimum=6):
     """Scale a base matplotlib font size by the user's chart-font preference."""
     return app_settings.scaled_size(base_size, _CHART_FONT_SCALE, minimum)
+
+def set_panel_title(ax, name, stat=None, base_size=10):
+    """
+    Set a panel title as two stacked lines: name on top, stat below,
+    inside ONE Text object (via "\\n"). A single long line
+    ("Name   ·   STAT +xx.x%") can overflow a narrow panel's width and
+    collide with the neighboring panel's title — splitting it into two
+    shorter lines keeps each one short enough to fit regardless of how
+    long the stat string gets. Using one Text object (vs. a separate
+    floating text element) matters because constrained_layout measures
+    the title's bounding box to reserve row height — a second, separate
+    text element above/below it is invisible to that measurement and
+    will get clipped or overlap neighboring rows.
+    """
+    title_str = f"{name}\n{stat}" if stat else name
+    ax.set_title(title_str, fontsize=fs(base_size), fontweight="bold",
+                 linespacing=1.4)
 
 def apply_style():
     refresh_chart_font_scale()
@@ -1203,15 +1262,16 @@ def plot_single_ticker(d, color, prefs=None):
 
     apply_style()
     year_range = f"{d['years'][0]}–{d['years'][-1]}" if d.get("years") else ""
-    fig = plt.figure(figsize=(16, 11), facecolor="white")   # room for per-panel tables, tightened
+    fig = plt.figure(figsize=(16, 11), facecolor="white", dpi=100, layout="constrained")
     fig.suptitle(f"{d['symbol']} — {d['name']}  |  Fundamentals {year_range}",
-                 fontsize=fs(14), fontweight="bold", y=0.985)
+                 fontsize=fs(14), fontweight="bold")
 
-    # Outer 2x3 grid, each cell will itself be split chart/table via
-    # _make_panel_gridspec. height_ratios on the outer grid keep all six
-    # outer cells the same height; the 3:1 chart:table split happens inside.
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.22, wspace=0.40,
-                             top=0.94, bottom=0.07)
+    # Outer grid: 2 rows of panels + 1 thin footer row, all real GridSpec
+    # rows so layout="constrained" reserves space for the footer too.
+    # (fig.text() at a fixed y= would NOT be seen by constrained layout —
+    # it'd float at a fixed fraction and collide with panels on resize.)
+    gs  = gridspec.GridSpec(3, 3, figure=fig, hspace=0.22, wspace=0.40,
+                             height_ratios=[1, 1, 0.18])
     yrs = year_labels(d["years"])
     x   = np.arange(len(yrs))
 
@@ -1233,10 +1293,8 @@ def plot_single_ticker(d, color, prefs=None):
     if d.get("analyst_tp"):
         ax1.axhline(d["analyst_tp"], color="#888", linestyle=":", linewidth=1,
                     label=f"TP ${d['analyst_tp']:,.2f}")
-    title1 = "Share Price ($)"
-    if price_cagr is not None:
-        title1 += f"   ·   CAGR {price_cagr:+.1f}%"
-    ax1.set_title(title1, fontsize=fs(10), fontweight="bold")
+    title1_stat = f"CAGR {price_cagr:+.1f}%" if price_cagr is not None else None
+    set_panel_title(ax1, "Share Price ($)", title1_stat)
     ax1.set_xticks(x[::2]); ax1.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax1.legend(fontsize=fs(7))
     add_zero_line(ax1)
@@ -1282,10 +1340,8 @@ def plot_single_ticker(d, color, prefs=None):
     pe_clean = [v for v in d["pe"] if v is not None]
     if pe_clean:
         avg_pe_5 = round(sum(pe_clean[-5:]) / len(pe_clean[-5:]), 1)
-    title2 = "P/E Ratio & PEG"
-    if fwd_pe and avg_pe_5:
-        title2 += f"   ·   Fwd/Avg {fwd_pe/avg_pe_5:.2f}x"
-    ax2.set_title(title2, fontsize=fs(10), fontweight="bold")
+    title2_stat = f"Fwd/Avg {fwd_pe/avg_pe_5:.2f}x" if (fwd_pe and avg_pe_5) else None
+    set_panel_title(ax2, "P/E Ratio & PEG", title2_stat)
     ax2.set_xticks(x[::2]); ax2.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax2.tick_params(axis="y", labelsize=fs(8))
     ax2b.tick_params(axis="y", labelsize=fs(8), colors="#F59E0B")
@@ -1310,10 +1366,8 @@ def plot_single_ticker(d, color, prefs=None):
     _draw_series(ax3, yrs, x, d["eps"], s3_eps, color, alpha=0.50, label="EPS ($)")
     _draw_series(ax3b, yrs, x, d["roe"], s3_roe, "#EF4444", alpha=0.60, label="ROE (%)", marker="s")
 
-    title3 = "EPS ($) & ROE (%)"
-    if eps_cagr_v is not None:
-        title3 += f"   ·   EPS CAGR {eps_cagr_v:+.1f}%"
-    ax3.set_title(title3, fontsize=fs(10), fontweight="bold")
+    title3_stat = f"EPS CAGR {eps_cagr_v:+.1f}%" if eps_cagr_v is not None else None
+    set_panel_title(ax3, "EPS ($) & ROE (%)", title3_stat)
     ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax3.tick_params(axis="y", labelsize=fs(8))
     ax3b.tick_params(axis="y", labelsize=fs(8), colors="#EF4444")
@@ -1345,10 +1399,8 @@ def plot_single_ticker(d, color, prefs=None):
     _draw_series(ax4, yrs, x, d["bvps"], s4_bvps, color, alpha=0.50, label="BV/Sh ($)")
     _draw_series(ax4b, yrs, x, da_pct, s4_debt, "#06B6D4", alpha=0.60, label="Debt/Assets (%)")
 
-    title4 = "Book Value/Share & Debt/Assets"
-    if bvps_cagr is not None:
-        title4 += f"   ·   BVPS CAGR {bvps_cagr:+.1f}%"
-    ax4.set_title(title4, fontsize=fs(10), fontweight="bold")
+    title4_stat = f"BVPS CAGR {bvps_cagr:+.1f}%" if bvps_cagr is not None else None
+    set_panel_title(ax4, "Book Value/Share & Debt/Assets", title4_stat)
     ax4.set_xticks(x[::2]); ax4.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax4.tick_params(axis="y", labelsize=fs(8))
     ax4b.tick_params(axis="y", labelsize=fs(8), colors="#06B6D4")
@@ -1374,10 +1426,8 @@ def plot_single_ticker(d, color, prefs=None):
     ax5.set_axisbelow(True)
     _draw_series(ax5, yrs, x, d["ocfps"], s5_ocf, color, alpha=0.50, label="OCF/Sh ($)")
     _draw_series(ax5, yrs, x, d["fcfps"], s5_fcf, "#10B981", alpha=0.90, label="FCF/Sh ($)", marker="o", linewidth=2.5)
-    title5 = "OCF/Share & FCF/Share ($)"
-    if fcf_cagr is not None:
-        title5 += f"   ·   FCF CAGR {fcf_cagr:+.1f}%"
-    ax5.set_title(title5, fontsize=fs(10), fontweight="bold")
+    title5_stat = f"FCF CAGR {fcf_cagr:+.1f}%" if fcf_cagr is not None else None
+    set_panel_title(ax5, "OCF/Share & FCF/Share ($)", title5_stat)
     ax5.set_xticks(x[::2]); ax5.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax5.tick_params(axis="y", labelsize=fs(8))
     ax5.legend(fontsize=fs(7))
@@ -1403,10 +1453,8 @@ def plot_single_ticker(d, color, prefs=None):
         _draw_series(ax6b, yrs, x, d["divps"], s6_div, "#7C3AED", alpha=0.80, label="Div/Sh ($)", marker="D")
         ax6b.tick_params(axis="y", labelsize=fs(8), colors="#8B5CF6")
         ax6b.set_ylabel("Div/Sh ($)", fontsize=fs(8), color="#8B5CF6")
-    title6 = "Revenue/Share & Div/Share ($)"
-    if rev_cagr is not None:
-        title6 += f"   ·   Rev/Sh CAGR {rev_cagr:+.1f}%"
-    ax6.set_title(title6, fontsize=fs(10), fontweight="bold")
+    title6_stat = f"Rev/Sh CAGR {rev_cagr:+.1f}%" if rev_cagr is not None else None
+    set_panel_title(ax6, "Revenue/Share & Div/Share ($)", title6_stat)
     ax6.set_xticks(x[::2]); ax6.set_xticklabels(yrs[::2], fontsize=fs(8))
     ax6.tick_params(axis="y", labelsize=fs(8))
     lines6 = [
@@ -1422,15 +1470,12 @@ def plot_single_ticker(d, color, prefs=None):
         table6_rows.append(("Div/Sh ($)", "#7C3AED", d["divps"], lambda v: f"${v:.2f}"))
     _draw_panel_table(tbl6, yrs, table6_rows)
 
-    # ── Footer — full-window summary line ────────────────────────────────────
+    # ── Footer — full-window summary line, in its own GridSpec row ──────────
     consensus_str = d.get("consensus", "")
     tp_str  = f"  TP ${d['analyst_tp']:,.2f}" if d.get("analyst_tp") else ""
     low_str = f"  Low ${d['analyst_low']:,.2f}" if d.get("analyst_low") else ""
     hi_str  = f"  High ${d['analyst_high']:,.2f}" if d.get("analyst_high") else ""
     peg_str = f"  PEG {cur_peg:.2f}" if cur_peg else ""
-    fig.text(0.5, 0.035,
-             f"Analyst Consensus: {consensus_str}{tp_str}{low_str}{hi_str}{peg_str}",
-             ha="center", fontsize=fs(9), color="#555", fontfamily="monospace")
 
     summary_parts = []
     if rev_cagr is not None:
@@ -1443,13 +1488,19 @@ def plot_single_ticker(d, color, prefs=None):
         summary_parts.append(f"ROE avg: {roe_avg_full:.1f}%")
     if fwd_pe and avg_pe_5:
         summary_parts.append(f"Fwd PE vs Hist: {fwd_pe/avg_pe_5:.2f}x")
+
+    ax_footer = fig.add_subplot(gs[2, :])
+    ax_footer.axis("off")
+    ax_footer.text(0.5, 0.75,
+             f"Analyst Consensus: {consensus_str}{tp_str}{low_str}{hi_str}{peg_str}",
+             ha="center", va="center", transform=ax_footer.transAxes,
+             fontsize=fs(9), color="#555", fontfamily="monospace")
     if summary_parts:
-        fig.text(0.5, 0.012, "  |  ".join(summary_parts),
-                 ha="center", fontsize=fs(9), fontweight="bold",
+        ax_footer.text(0.5, 0.15, "  |  ".join(summary_parts),
+                 ha="center", va="center", transform=ax_footer.transAxes,
+                 fontsize=fs(9), fontweight="bold",
                  color="#1A1A2E", fontfamily="monospace")
 
-    for ax in [ax1, ax2, ax3, ax4, ax5, ax6]:
-        mplcursors.cursor(ax, hover=True)
     return fig
 
 
@@ -1459,9 +1510,9 @@ def plot_single_ticker(d, color, prefs=None):
 
 def plot_comparison(data_list, colors):
     apply_style()
-    fig, axes = plt.subplots(3, 3, figsize=(18, 14), facecolor="white")
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14), facecolor="white", dpi=100, layout="constrained")
     fig.suptitle("All Tickers — Side-by-Side Comparison",
-                 fontsize=fs(14), fontweight="bold", y=0.99)
+                 fontsize=fs(14), fontweight="bold")
 
     base_years = data_list[0]["years"]
     yrs = year_labels(base_years)
@@ -1499,9 +1550,8 @@ def plot_comparison(data_list, colors):
         add_zero_line(ax)
         ticker_legend(ax, data_list, colors)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.97], h_pad=3.0)
-    for ax in fig.axes:
-        mplcursors.cursor(ax, hover=True)
+    # layout="constrained" (set at figure creation) handles spacing on
+    # every draw, including window resize — no manual tight_layout needed.
     return fig
 
 
@@ -1523,9 +1573,9 @@ def plot_snapshot(data_list, colors):
         ("divps",       "Div/Share ($)",     "$"),
     ]
 
-    fig, axes = plt.subplots(2, 4, figsize=(18, 9), facecolor="white")
+    fig, axes = plt.subplots(2, 4, figsize=(18, 9), facecolor="white", dpi=100, layout="constrained")
     fig.suptitle("Latest Year — All Tickers Snapshot",
-                 fontsize=fs(14), fontweight="bold", y=1.00)
+                 fontsize=fs(14), fontweight="bold")
 
     syms = [d["symbol"] for d in data_list]
     x    = np.arange(len(syms))
@@ -1557,9 +1607,8 @@ def plot_snapshot(data_list, colors):
                     label, ha="center", va="bottom" if v >= 0 else "top",
                     fontsize=fs(11), fontweight="bold", fontfamily="monospace")
 
-    plt.tight_layout()
-    for ax in fig.axes:
-        mplcursors.cursor(ax, hover=True)
+    # layout="constrained" (set at figure creation) handles spacing on
+    # every draw, including window resize — no manual tight_layout needed.
     return fig
 
 def cagr(prices, n):
@@ -1577,9 +1626,9 @@ def plot_etf(etf_list, colors, years_back):
     apply_style()
     n = len(etf_list)
 
-    fig = plt.figure(figsize=(18, 10), facecolor="white")
+    fig = plt.figure(figsize=(18, 10), facecolor="white", dpi=100, layout="constrained")
     fig.suptitle("ETF Overview — Price, Distributions & Annual Return",
-                 fontsize=fs(14), fontweight="bold", y=0.98)
+                 fontsize=fs(14), fontweight="bold")
 
     gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.4, wspace=0.35)
 
@@ -1661,9 +1710,8 @@ def plot_etf(etf_list, colors, years_back):
     ax3.set_xticks(x[::2]); ax3.set_xticklabels(yrs[::2], fontsize=fs(8), rotation=30)
     ticker_legend(ax3, etf_list, colors)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    for ax in [ax0, ax1, ax2, ax3]:
-        mplcursors.cursor(ax, hover=True)
+    # layout="constrained" (set at figure creation) handles spacing on
+    # every draw, including window resize — no manual tight_layout needed.
     return fig
 
 

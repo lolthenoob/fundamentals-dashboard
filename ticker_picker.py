@@ -2037,6 +2037,24 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     _make_toggle_btn(ctrl, "Re-download",  refresh_var,     side="right", padx=(0, 8))
     _make_toggle_btn(ctrl, "Export files", export_var,      side="right", padx=(0, 8))
 
+    # ── Fit window width to actual content ─────────────────────────────────
+    # WINDOW_WIDTH (1600) is only a starting guess. The bottom control bar
+    # (Select All / Clear All / History / Export files / Re-download /
+    # Show charts / Go) and the watchlist bar are the two rows most likely
+    # to overflow or leave a big empty gap, since every other row wraps or
+    # scrolls. Measure their real required width now that every button in
+    # them has been packed, and resize the window to fit — clamped to the
+    # actual screen so it never runs off-screen on a smaller monitor.
+    root.update_idletasks()
+    _content_w = max(
+        ctrl.winfo_reqwidth(),
+        wl_frame.winfo_reqwidth(),
+    )
+    _margin = 40
+    _desired_w = _content_w + _margin
+    _final_w = max(500, min(_desired_w, work_w - deco_w * 2))
+    root.geometry(f"{_final_w}x{root.winfo_height()}+{root.winfo_x()}+{root.winfo_y()}")
+
     # ── Status panel (hidden until Go is pressed) ─────────────────────────
     status_panel = tk.Frame(root, bg=CLR_BG)
     # Hidden label keeps the tick_font in the widget tree so tkinter's
