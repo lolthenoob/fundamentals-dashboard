@@ -322,7 +322,7 @@ def show_stock_table_growth(data_list, colors, years_back):
     FCF/Sh CAGR, Gross/Operating/Net margin (latest + trend), FCF margin.
     """
     columns = [
-        "name", "price",
+        "name", "price", "price_cagr_full",
         "rev_cagr_3", "rev_cagr_5",
         "eps_cagr_full", "eps_cagr_3", "eps_cagr_5",
         "fcf_cagr",
@@ -332,7 +332,7 @@ def show_stock_table_growth(data_list, colors, years_back):
         "fcf_margin",
     ]
     headings = [
-        "Name", "Price",
+        "Name", "Price", f"Price CAGR (full {years_back}yr)",
         "Rev CAGR 3yr", "Rev CAGR 5yr",
         f"EPS CAGR (full {years_back}yr)", "EPS CAGR 3yr", "EPS CAGR 5yr",
         "FCF/Sh CAGR",
@@ -353,6 +353,11 @@ def show_stock_table_growth(data_list, colors, years_back):
         cp = d.get("current_price")
         row["price"] = (_cell(f"${float(cp):,.2f}", float(cp), CLR_NAME)
                          if cp is not None else _cell("N/A", None, CLR_NEUTRAL))
+
+        # Price CAGR — full window
+        price_cagr = _cagr_full_window(d["prices"], d["years"])
+        row["price_cagr_full"] = (_cell(f"{price_cagr:+.1f}%", price_cagr, CLR_GREEN if price_cagr >= 0 else CLR_RED)
+                                  if price_cagr is not None else _cell("N/A", None, CLR_NEUTRAL))
 
         # Revenue CAGR 3yr / 5yr — needs "revps" (already present) scaled
         # by shares is not required since CAGR is scale-invariant; per-share
@@ -569,6 +574,218 @@ def show_stock_table_valuation(data_list, colors, years_back):
 
     SortableTable(
         title="Stock Scorecard — Valuation, Balance Sheet & Capital Return",
+        columns=columns,
+        headings=headings,
+        rows=rows,
+        row_labels=row_labels,
+        min_col_w=130,
+    )
+
+
+# ── Quarterly scorecard — Table 1: Earnings Quality ───────────────────────────
+
+def show_stock_table_quarterly_earnings(quarterly_list, colors):
+    """
+    Quarterly Earnings Quality scorecard.
+    Columns: Name, Latest Quarter, EPS Surprise %, Beat/Miss streak,
+    Revenue YoY %, Net Margin (latest / 5q avg).
+
+    quarterly_list: list of per-symbol dicts as returned by
+    load_quarterly_from_db() / trim_to_quarters(), each with "symbol" and
+    "name" already set (mirrors the data plot_quarterly_pulse consumes —
+    see that function's docstring for the name/symbol setup main.py does
+    before calling it).
+    """
+    columns = [
+        "name", "latest_q",
+        "eps_surprise", "beat_streak",
+        "rev_yoy",
+        "net_margin_lat", "net_margin_avg",
+    ]
+    headings = [
+        "Name", "Latest Qtr",
+        "EPS Surprise %", "Beat/Miss",
+        "Revenue YoY %",
+        "Net Margin (latest)", "Net Margin (5q avg)",
+    ]
+
+    rows, row_labels = [], []
+
+    for d in quarterly_list:
+        row_labels.append(d["symbol"])
+        row = {}
+
+        row["name"] = _cell(d.get("name", ""), d.get("name", ""), CLR_NAME)
+
+        q_ends = d.get("quarter_ends", [])
+        fq     = d.get("fiscal_quarters", [])
+        fy     = d.get("fiscal_years", [])
+        if q_ends and fq and fy:
+            label = f"Q{fq[-1]} '{str(fy[-1])[-2:]}"
+            row["latest_q"] = _cell(label, label, CLR_NAME)
+        else:
+            row["latest_q"] = _cell("N/A", None, CLR_NEUTRAL)
+
+        # EPS Surprise % — latest quarter only, same formula as the
+        # per-quarter chart panel: (actual - estimate) / |estimate|.
+        eps_actual   = d.get("eps_actual", [])
+        eps_estimate = d.get("eps_estimate", [])
+        surprise_series = []
+        for ea, ee in zip(eps_actual, eps_estimate):
+            if ea is None or ee is None or ee == 0:
+                surprise_series.append(None)
+            else:
+                surprise_series.append((ea - ee) / abs(ee) * 100.0)
+        lat_surprise = _latest(surprise_series)
+        if np.isnan(lat_surprise):
+            row["eps_surprise"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if lat_surprise >= 0 else CLR_RED
+            row["eps_surprise"] = _cell(f"{lat_surprise:+.1f}%", lat_surprise, bg)
+
+        # Beat/Miss streak — "beats out of quarters with an estimate"
+        # over whatever window is loaded, e.g. "4/5".
+        compared = [(ea, ee) for ea, ee in zip(eps_actual, eps_estimate)
+                    if ea is not None and ee is not None]
+        if compared:
+            beats = sum(1 for ea, ee in compared if ea >= ee)
+            total = len(compared)
+            ratio = beats / total
+            bg = CLR_GREEN if ratio >= 0.75 else (CLR_YELLOW if ratio >= 0.5 else CLR_RED)
+            row["beat_streak"] = _cell(f"{beats}/{total}", ratio, bg)
+        else:
+            row["beat_streak"] = _cell("N/A", None, CLR_NEUTRAL)
+
+        # Revenue YoY % — same quarter, 4 positions back. Only available
+        # once 5+ quarters have accumulated in the DB for this symbol.
+        revenue = d.get("revenue", [])
+        yoy_series = [None] * len(revenue)
+        for i in range(4, len(revenue)):
+            cur, prior = revenue[i], revenue[i - 4]
+            if cur is not None and prior is not None and prior != 0:
+                yoy_series[i] = (cur - prior) / abs(prior) * 100.0
+        lat_yoy = _latest(yoy_series)
+        if np.isnan(lat_yoy):
+            row["rev_yoy"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if lat_yoy >= 0 else CLR_RED
+            row["rev_yoy"] = _cell(f"{lat_yoy:+.1f}%", lat_yoy, bg)
+
+        # Net Margin — latest quarter and 5-quarter average, same
+        # thresholds as the yearly Growth & Quality table's margin rows.
+        net_margin = d.get("net_margin", [])
+        nm_lat = _latest(net_margin)
+        if np.isnan(nm_lat):
+            row["net_margin_lat"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if nm_lat >= 20 else (CLR_YELLOW if nm_lat >= 10 else CLR_RED)
+            row["net_margin_lat"] = _cell(f"{nm_lat:.1f}%", nm_lat, bg)
+
+        nm_avg = _avg_last_n(net_margin, 5)
+        if nm_avg is None:
+            row["net_margin_avg"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if nm_avg >= 20 else (CLR_YELLOW if nm_avg >= 10 else CLR_RED)
+            row["net_margin_avg"] = _cell(f"{nm_avg:.1f}%", nm_avg, bg)
+
+        rows.append(row)
+
+    SortableTable(
+        title="Quarterly Scorecard — Earnings Quality",
+        columns=columns,
+        headings=headings,
+        rows=rows,
+        row_labels=row_labels,
+        min_col_w=120,
+    )
+
+
+# ── Quarterly scorecard — Table 2: Cash, Capital Intensity & Valuation ───────
+
+def show_stock_table_quarterly_valuation(quarterly_list, colors):
+    """
+    Quarterly Cash, Capital Intensity & Valuation scorecard.
+    Columns: Name, FCF Margin (latest), CapEx/OCF % (latest),
+    P/E (latest vs 5q avg), Price Reaction % (latest earnings).
+    """
+    columns = [
+        "name",
+        "fcf_margin", "capex_ocf",
+        "pe_lat", "pe_avg",
+        "reaction",
+    ]
+    headings = [
+        "Name",
+        "FCF Margin (latest)", "CapEx/OCF % (latest)",
+        "P/E (latest)", "P/E (5q avg)",
+        "Price Reaction %",
+    ]
+
+    rows, row_labels = [], []
+
+    for d in quarterly_list:
+        row_labels.append(d["symbol"])
+        row = {}
+
+        row["name"] = _cell(d.get("name", ""), d.get("name", ""), CLR_NAME)
+
+        # FCF Margin — FCF / Revenue, latest quarter.
+        fcf     = d.get("fcf", [])
+        revenue = d.get("revenue", [])
+        fcf_margin_series = []
+        for f, r in zip(fcf, revenue):
+            fcf_margin_series.append(f / r * 100.0 if (r and f is not None) else None)
+        fm_lat = _latest(fcf_margin_series)
+        if np.isnan(fm_lat):
+            row["fcf_margin"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if fm_lat >= 15 else (CLR_YELLOW if fm_lat >= 5 else CLR_RED)
+            row["fcf_margin"] = _cell(f"{fm_lat:.1f}%", fm_lat, bg)
+
+        # CapEx/OCF % — abs(capex)/ocf, latest quarter. Flagged red when
+        # spiking, same intuition as the chart panel's intensity line.
+        ocf   = d.get("ocf", [])
+        capex = d.get("capex", [])
+        intensity_series = []
+        for o, c in zip(ocf, capex):
+            c_abs = abs(c) if c is not None else None
+            intensity_series.append(c_abs / o * 100.0 if (o and c_abs is not None) else None)
+        int_lat = _latest(intensity_series)
+        if np.isnan(int_lat):
+            row["capex_ocf"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if int_lat <= 50 else (CLR_YELLOW if int_lat <= 75 else CLR_RED)
+            row["capex_ocf"] = _cell(f"{int_lat:.0f}%", int_lat, bg)
+
+        # P/E — latest quarter vs 5-quarter average, same "cheap/expensive
+        # relative to its own recent range" idea as the yearly Fwd/Avg P/E.
+        pe = d.get("pe", [])
+        pe_lat = _latest(pe)
+        if np.isnan(pe_lat):
+            row["pe_lat"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            row["pe_lat"] = _cell(f"{pe_lat:.1f}x", pe_lat, CLR_NAME)
+
+        pe_avg = _avg_last_n(pe, 5)
+        if pe_avg is None:
+            row["pe_avg"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            row["pe_avg"] = _cell(f"{pe_avg:.1f}x", pe_avg, CLR_NAME)
+
+        # Price Reaction % — latest earnings-date move, already computed
+        # upstream as d["price_react_pct"] for the Panel 1 chart/table.
+        reaction = d.get("price_react_pct", [])
+        reac_lat = _latest(reaction)
+        if np.isnan(reac_lat):
+            row["reaction"] = _cell("N/A", None, CLR_NEUTRAL)
+        else:
+            bg = CLR_GREEN if reac_lat >= 0 else CLR_RED
+            row["reaction"] = _cell(f"{reac_lat:+.1f}%", reac_lat, bg)
+
+        rows.append(row)
+
+    SortableTable(
+        title="Quarterly Scorecard — Cash, Capital Intensity & Valuation",
         columns=columns,
         headings=headings,
         rows=rows,

@@ -22,7 +22,8 @@ CONFIGURE YOUR TICKERS HERE:
 # ─────────────────────────────────────────────────────────────────────────────
 from ticker_picker import pick_tickers, post_status
 from interactive_table import (
-    show_stock_table_growth, show_stock_table_valuation, show_etf_table
+    show_stock_table_growth, show_stock_table_valuation, show_etf_table,
+    show_stock_table_quarterly_earnings, show_stock_table_quarterly_valuation,
 )
 import app_settings
 import warnings
@@ -41,9 +42,10 @@ import matplotlib
 matplotlib.use("TkAgg")          # change to "Qt5Agg" if TkAgg isn't available
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+import matplotlib.ticker as mticker
 from matplotlib.lines import Line2D
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 # ── Colour palette (cycles if more tickers than colours) ─────────────────────
@@ -173,6 +175,41 @@ def _create_tables(conn):
             distribution    REAL,
             annual_return   REAL,
             PRIMARY KEY (symbol, fiscal_year),
+            FOREIGN KEY (symbol) REFERENCES tickers(symbol)
+        );
+
+        -- 2026-06-20: one row per ticker × reported quarter (date-keyed, not
+        -- fiscal-quarter-int-keyed — see notes in upsert_quarterly). This
+        -- table is append-only by design: every run upserts whatever
+        -- quarters yfinance currently exposes (~4-5 live), but old quarters
+        -- already saved here are NEVER dropped just because yfinance's live
+        -- window rolled past them. That's the whole point — it's what lets
+        -- a one-off shock quarter (e.g. a macro-driven P/E trough) stay
+        -- queryable years later even though yfinance itself only remembers
+        -- the last year or so at any given time.
+        CREATE TABLE IF NOT EXISTS quarterly_data (
+            symbol          TEXT    NOT NULL,
+            quarter_end     TEXT    NOT NULL,   -- ISO date 'YYYY-MM-DD', period end
+            fiscal_year     INTEGER,            -- derived, display label only
+            fiscal_quarter  INTEGER,            -- 1-4, derived, display label only
+            earnings_date   TEXT,                -- ISO date of the actual report
+            price           REAL,                -- close on/near quarter_end
+            eps_actual      REAL,
+            eps_estimate    REAL,
+            pe              REAL,
+            revenue         REAL,
+            net_income      REAL,
+            gross_margin    REAL,
+            op_margin       REAL,
+            net_margin      REAL,
+            debt            REAL,
+            ocf             REAL,
+            capex           REAL,
+            fcf             REAL,
+            cash            REAL,
+            price_react_pct REAL,                -- stock move N days post-earnings
+            last_updated    TEXT,
+            PRIMARY KEY (symbol, quarter_end),
             FOREIGN KEY (symbol) REFERENCES tickers(symbol)
         );
     """)
@@ -359,6 +396,125 @@ def load_ticker_from_db(conn, symbol):
         "buyback_yield":     row["buyback_yield"],
         "dividend_yield":    row["dividend_yield"],
     }
+
+def upsert_quarterly(conn, d):
+    """
+    Append-only by design — see the quarterly_data table comment in
+    _create_tables(). Every call inserts/refreshes exactly the quarters
+    present in `d` (whatever yfinance's live ~4-5 quarter window currently
+    returns); ON CONFLICT only updates rows matching those dates, so older
+    quarters already saved from a previous run that have since rolled out
+    of yfinance's window are left completely untouched. Nothing is ever
+    deleted here.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    n   = len(d["quarter_ends"])
+
+    def get(key):
+        return d.get(key, [None] * n)
+
+    rows = zip(
+        d["quarter_ends"], get("fiscal_years"), get("fiscal_quarters"),
+        get("earnings_dates"), get("prices"), get("eps_actual"),
+        get("eps_estimate"), get("pe"), get("revenue"), get("net_income"),
+        get("gross_margin"), get("op_margin"), get("net_margin"),
+        get("debt"), get("ocf"), get("capex"), get("fcf"), get("cash"),
+        get("price_react_pct"),
+    )
+    # pe needs 4 trailing quarters in *this* fetch to compute (see
+    # download_ticker_quarterly) — a quarter can still be in the live
+    # window but sitting too early in it to have that depth. COALESCE
+    # below keeps whatever real P/E was saved earlier rather than
+    # blanking it out just because this refresh's window didn't reach
+    # back far enough for it.
+    conn.executemany("""
+        INSERT INTO quarterly_data
+            (symbol, quarter_end, fiscal_year, fiscal_quarter, earnings_date,
+             price, eps_actual, eps_estimate, pe, revenue, net_income,
+             gross_margin, op_margin, net_margin, debt, ocf, capex, fcf, cash,
+             price_react_pct, last_updated)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(symbol, quarter_end) DO UPDATE SET
+            fiscal_year     = excluded.fiscal_year,
+            fiscal_quarter  = excluded.fiscal_quarter,
+            earnings_date   = excluded.earnings_date,
+            price           = excluded.price,
+            eps_actual      = excluded.eps_actual,
+            eps_estimate    = excluded.eps_estimate,
+            pe              = COALESCE(excluded.pe, pe),
+            revenue         = excluded.revenue,
+            net_income      = excluded.net_income,
+            gross_margin    = excluded.gross_margin,
+            op_margin       = excluded.op_margin,
+            net_margin      = excluded.net_margin,
+            debt            = excluded.debt,
+            ocf             = excluded.ocf,
+            capex           = excluded.capex,
+            fcf             = excluded.fcf,
+            cash            = excluded.cash,
+            price_react_pct = excluded.price_react_pct,
+            last_updated    = excluded.last_updated
+    """, [
+        (d["symbol"], qe, fy, fq, ed, p, epsa, epse, pe, rev, ni,
+         gm, om, nm, debt, ocf, capex, fcf, cash, reac, now)
+        for qe, fy, fq, ed, p, epsa, epse, pe, rev, ni, gm, om, nm, debt, ocf, capex, fcf, cash, reac
+        in rows
+    ])
+
+    conn.commit()
+    print(f"    \u2192 Saved {d['symbol']} quarterly data to DB ({n} quarter(s))")
+
+
+def load_quarterly_from_db(conn, symbol, start=None, end=None):
+    """
+    Read back accumulated quarterly history for a symbol.
+
+    `start`/`end` are optional ISO date strings ('YYYY-MM-DD') bounding
+    quarter_end — this is the explicit-date-range display mode (pulling up
+    a specific past quarter, e.g. a macro-shock trough, regardless of how
+    recent it is). For the simpler "last N quarters" display mode, leave
+    start/end blank and slice the result with trim_to_quarters() instead.
+    """
+    query  = "SELECT * FROM quarterly_data WHERE symbol = ?"
+    params = [symbol]
+    if start:
+        query += " AND quarter_end >= ?"
+        params.append(start)
+    if end:
+        query += " AND quarter_end <= ?"
+        params.append(end)
+    query += " ORDER BY quarter_end"
+
+    rows = conn.execute(query, params).fetchall()
+    if not rows:
+        return None
+
+    def col(field):
+        return [r[field] for r in rows]
+
+    return {
+        "symbol":          symbol,
+        "quarter_ends":    col("quarter_end"),
+        "fiscal_years":    col("fiscal_year"),
+        "fiscal_quarters": col("fiscal_quarter"),
+        "earnings_dates":  col("earnings_date"),
+        "prices":          col("price"),
+        "eps_actual":      col("eps_actual"),
+        "eps_estimate":    col("eps_estimate"),
+        "pe":              col("pe"),
+        "revenue":         col("revenue"),
+        "net_income":      col("net_income"),
+        "gross_margin":    col("gross_margin"),
+        "op_margin":       col("op_margin"),
+        "net_margin":      col("net_margin"),
+        "debt":            col("debt"),
+        "ocf":             col("ocf"),
+        "capex":           col("capex"),
+        "fcf":             col("fcf"),
+        "cash":            col("cash"),
+        "price_react_pct": col("price_react_pct"),
+    }
+
 
 def upsert_etf(conn, d, years_requested):
     now = datetime.now().isoformat(timespec="seconds")
@@ -825,9 +981,32 @@ def download_ticker(symbol, years_back):
         except Exception:
             buyback_yield = None
 
-        dividend_yield = info.get("dividendYield")
-        if dividend_yield is not None:
-            dividend_yield = round(dividend_yield * 100, 2) if dividend_yield < 1 else round(dividend_yield, 2)
+        # 2026-06-21: dividend_yield used to come straight from Yahoo's
+        # info["dividendYield"], with a `< 1` check trying to guess whether
+        # that number was a fraction (0.0072) or already a percent (0.72).
+        # That guess is unfixable as written — a sub-1%-yield stock and a
+        # fraction both land under 1, so they're numerically identical to
+        # the heuristic. MSFT (~0.7% yield) is exactly that case: 0.72 reads
+        # as "must be a fraction," gets multiplied by 100, and comes out as
+        # a fake 72% yield. Whichever convention Yahoo happens to use this
+        # week, the ambiguity is structural, not a caching issue.
+        #
+        # Sidestep it entirely — divps and current_price are both already
+        # known in unambiguous units (dollars), so the yield can be derived
+        # directly instead of trusting Yahoo's pre-formatted figure.
+        dividend_yield = None
+        try:
+            latest_divps = divps[-1] if divps else None
+            if latest_divps and current_price and current_price > 0:
+                dividend_yield = round(latest_divps / current_price * 100, 2)
+            else:
+                # Best-effort fallback only — same ambiguity as before, but
+                # better than nothing if divps/current_price aren't available.
+                raw = info.get("dividendYield")
+                if raw is not None:
+                    dividend_yield = round(raw * 100, 2) if raw < 1 else round(raw, 2)
+        except Exception:
+            dividend_yield = None
 
         print("OK")
         return {
@@ -863,6 +1042,230 @@ def download_ticker(symbol, years_back):
             "interest_coverage":  interest_coverage,
             "buyback_yield":      buyback_yield,
             "dividend_yield":     dividend_yield,
+        }
+
+    except Exception as e:
+        print(f"FAILED ({e})")
+        return None
+
+def download_ticker_quarterly(symbol):
+    """
+    Pulls whatever quarters yfinance currently exposes live — typically the
+    last ~4-5, sometimes fewer. Deliberately no quarters_back parameter:
+    fetch always grabs the full live window every time, since there's no
+    upside to asking for less than the max. How many quarters get
+    *displayed* later is a separate decision, made against whatever's been
+    accumulated in the DB across runs — see trim_to_quarters() and the
+    start=/end= filter on load_quarterly_from_db().
+
+    Network note: this can't be exercised against live Yahoo Finance data
+    in a sandboxed environment without internet access to that domain —
+    verify this against real data once it's running locally.
+    """
+    print(f"  Downloading {symbol} (quarterly) ...", end=" ", flush=True)
+    try:
+        t   = yf.Ticker(symbol)
+        inc = t.quarterly_income_stmt
+        bs  = t.quarterly_balance_sheet
+        cf  = t.quarterly_cashflow
+
+        if inc.empty:
+            print("FAILED (no quarterly income data)")
+            return None
+
+        dates           = sorted(inc.columns)
+        dates           = [d.tz_localize(None) if getattr(d, "tzinfo", None) is not None else d
+                            for d in dates]
+        quarter_ends    = [d.strftime("%Y-%m-%d") for d in dates]
+        fiscal_years    = [d.year for d in dates]
+        fiscal_quarters = [(d.month - 1) // 3 + 1 for d in dates]
+
+        shares_row = safe_row(inc,
+            "Diluted Average Shares", "Basic Average Shares",
+            "DilutedAverageShares",   "BasicAverageShares")
+        ni_row  = safe_row(inc, "Net Income", "NetIncome",
+                            "Net Income Common Stockholders")
+        rev_row = safe_row(inc, "Total Revenue", "TotalRevenue", "Revenue")
+
+        # ── Actual EPS — prefer the reported line item, fall back to
+        # net income / shares the same way download_ticker() does ─────────
+        eps_row = safe_row(inc, "Diluted EPS", "DilutedEPS", "Basic EPS", "BasicEPS")
+        eps_actual = []
+        for d in dates:
+            try:
+                if eps_row is not None and eps_row[d] is not None:
+                    eps_actual.append(round(float(eps_row[d]), 4))
+                else:
+                    ni = float(ni_row[d])
+                    sh = float(shares_row[d]) if shares_row is not None else None
+                    eps_actual.append(round(ni / sh, 4) if sh and sh > 0 else None)
+            except Exception:
+                eps_actual.append(None)
+
+        # ── Revenue & net income, raw totals (panel 3 plots these as bars,
+        # not per-share — unlike annual_data, which only ever stores
+        # per-share figures) ────────────────────────────────────────────────
+        revenue, net_income = [], []
+        for d in dates:
+            try:
+                revenue.append(round(float(rev_row[d]), 0) if rev_row is not None else None)
+            except Exception:
+                revenue.append(None)
+            try:
+                net_income.append(round(float(ni_row[d]), 0) if ni_row is not None else None)
+            except Exception:
+                net_income.append(None)
+
+        # ── Margins ──────────────────────────────────────────────────────────
+        gp_row     = safe_row(inc, "Gross Profit", "GrossProfit")
+        op_inc_row = safe_row(inc, "Operating Income", "OperatingIncome", "EBIT")
+        gross_margin, op_margin, net_margin = [], [], []
+        for d, rev in zip(dates, revenue):
+            try:
+                gross_margin.append(round(float(gp_row[d]) / rev * 100, 2)
+                                     if gp_row is not None and rev else None)
+            except Exception:
+                gross_margin.append(None)
+            try:
+                op_margin.append(round(float(op_inc_row[d]) / rev * 100, 2)
+                                  if op_inc_row is not None and rev else None)
+            except Exception:
+                op_margin.append(None)
+        for ni, rev in zip(net_income, revenue):
+            net_margin.append(round(ni / rev * 100, 2) if ni is not None and rev else None)
+
+        # ── Balance sheet: debt & cash, raw totals (panel 5) ────────────────
+        debt_row = safe_row(bs, "Total Debt", "TotalDebt",
+                             "Long Term Debt", "LongTermDebt")
+        cash_row = safe_row(bs, "Cash And Cash Equivalents", "CashAndCashEquivalents",
+                             "Cash Cash Equivalents And Short Term Investments")
+        debt, cash = [], []
+        for d in dates:
+            try:
+                debt.append(round(float(debt_row[d]), 0) if debt_row is not None else None)
+            except Exception:
+                debt.append(None)
+            try:
+                cash.append(round(float(cash_row[d]), 0) if cash_row is not None else None)
+            except Exception:
+                cash.append(None)
+
+        # ── Cash flow: OCF, CapEx, and FCF = OCF + CapEx (panel 4 needs OCF
+        # and CapEx as two distinct series, not just the combined figure
+        # panel 5 uses) ──────────────────────────────────────────────────
+        ocf_row   = safe_row(cf, "Operating Cash Flow", "OperatingCashFlow",
+                              "Cash Flow From Continuing Operating Activities")
+        capex_row = safe_row(cf, "Capital Expenditure", "CapitalExpenditure",
+                              "Purchase Of PPE", "PurchaseOfPPE")
+        ocf, capex_list, fcf = [], [], []
+        for d in dates:
+            try:
+                ocf.append(round(float(ocf_row[d]), 0))
+            except Exception:
+                ocf.append(None)
+            try:
+                capex_list.append(round(float(capex_row[d]), 0) if capex_row is not None else None)
+            except Exception:
+                capex_list.append(None)
+        for o, c in zip(ocf, capex_list):
+            try:
+                fcf.append(round(o + (c or 0), 0) if o is not None else None)
+            except Exception:
+                fcf.append(None)
+
+        # ── Quarter-end price + trailing P/E ────────────────────────────────
+        # t.history() comes back with a tz-aware index (localized to the
+        # exchange's timezone), but `dates` (quarterly_income_stmt columns)
+        # and `report_date` (get_earnings_history index) are both tz-naive —
+        # comparing the two directly raises "Invalid comparison between
+        # dtype=datetime64[s, tz] and Timestamp". Strip the tz here, once,
+        # rather than re-localizing every comparison below.
+        hist = t.history(start=dates[0] - timedelta(days=10), interval="1d")
+        if hist.index.tz is not None:
+            hist.index = hist.index.tz_localize(None)
+        prices = []
+        for d in dates:
+            sub = hist[hist.index <= d]
+            prices.append(round(float(sub["Close"].iloc[-1]), 2) if not sub.empty else None)
+
+        # Trailing P/E needs trailing-twelve-month EPS (this quarter plus
+        # the 3 before it) in the denominator — dividing price by a single
+        # quarter's EPS instead inflates the ratio ~4x versus the P/E
+        # everyone else quotes. That needs 4 consecutive quarters of EPS
+        # on file, so the earliest quarters won't have a P/E yet until
+        # enough quarterly history has accumulated in the DB.
+        pe = []
+        for i, p in enumerate(prices):
+            if p is None or i < 3:
+                pe.append(None)
+                continue
+            ttm_window = eps_actual[i - 3:i + 1]
+            if any(v is None for v in ttm_window):
+                pe.append(None)
+                continue
+            ttm_eps = sum(ttm_window)
+            pe.append(round(p / ttm_eps, 2) if ttm_eps > 0 else None)
+
+        # ── EPS estimate, earnings date, and price reaction ─────────────────
+        # get_earnings_history() is indexed by *report* date, not period-end,
+        # and typically covers roughly the same ~4-5 quarter window as the
+        # statements above but isn't guaranteed to line up 1:1. Align the
+        # two lists by chronological order from the most recent end, rather
+        # than assuming matching dates or matching counts.
+        eps_estimate    = [None] * len(dates)
+        earnings_dates  = [None] * len(dates)
+        price_react_pct = [None] * len(dates)
+        try:
+            eh = t.get_earnings_history()
+            if eh is not None and not eh.empty:
+                eh = eh[eh["epsActual"].notna()].sort_index()
+                n  = min(len(eh), len(dates))
+                if n > 0:
+                    eh_tail = eh.iloc[-n:]
+                    offset  = len(dates) - n
+                    for i, (report_date, row) in enumerate(eh_tail.iterrows()):
+                        idx = offset + i
+                        if getattr(report_date, "tzinfo", None) is not None:
+                            report_date = report_date.tz_localize(None)
+                        eps_estimate[idx]   = row.get("epsEstimate")
+                        earnings_dates[idx] = report_date.strftime("%Y-%m-%d")
+                        # Price reaction: close ~3 trading days after the
+                        # report vs. the close on/just before the report —
+                        # adjust the window here if you want a tighter
+                        # (next-day) or wider (one-week) reaction read.
+                        try:
+                            window = hist[hist.index >= report_date]
+                            if len(window) >= 4:
+                                before = float(window["Close"].iloc[0])
+                                after  = float(window["Close"].iloc[3])
+                                price_react_pct[idx] = round((after - before) / before * 100, 2)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        print("OK")
+        return {
+            "symbol":          symbol,
+            "quarter_ends":    quarter_ends,
+            "fiscal_years":    fiscal_years,
+            "fiscal_quarters": fiscal_quarters,
+            "earnings_dates":  earnings_dates,
+            "prices":          prices,
+            "eps_actual":      eps_actual,
+            "eps_estimate":    eps_estimate,
+            "pe":              pe,
+            "revenue":         revenue,
+            "net_income":      net_income,
+            "gross_margin":    gross_margin,
+            "op_margin":       op_margin,
+            "net_margin":      net_margin,
+            "debt":            debt,
+            "ocf":             ocf,
+            "capex":           capex_list,
+            "fcf":             fcf,
+            "cash":            cash,
+            "price_react_pct": price_react_pct,
         }
 
     except Exception as e:
@@ -1067,6 +1470,35 @@ def fmt_x(val, decimals=2):
     return f"{val:.{decimals}f}x" if val is not None else "N/A"
 
 
+def _money_tick(val, pos=None):
+    """Adaptive $ tick label — B/M/K picked by magnitude so it reads right
+    whether the series is mega-cap revenue (billions) or a smaller
+    ticker's (millions)."""
+    av = abs(val)
+    if av >= 1e9:
+        return f"${val/1e9:,.1f}B"
+    if av >= 1e6:
+        return f"${val/1e6:,.0f}M"
+    if av >= 1e3:
+        return f"${val/1e3:,.0f}K"
+    return f"${val:,.0f}"
+
+
+def apply_money_axis(ax):
+    """Swap in _money_tick for the y-axis's default ScalarFormatter.
+
+    matplotlib's own fix for big numbers is a 'x1e10' offset label parked
+    at the top-left of the axes — but the in-axes legend's loc="best"
+    only avoids overlapping plotted bars/lines, it has no idea that
+    offset text is sitting there too, so on a panel where the data is
+    short on the left (which is exactly when "best" picks upper-left)
+    the legend lands right on top of it. Giving every tick its own
+    self-contained "$70.1B" label removes the offset text entirely, so
+    there's nothing left for the legend to collide with.
+    """
+    ax.yaxis.set_major_formatter(mticker.FuncFormatter(_money_tick))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3b. TRIM HELPER
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1087,6 +1519,17 @@ STOCK_LIST_FIELDS = [
 ]
 ETF_LIST_FIELDS = ["years", "prices", "distributions", "annual_returns"]
 
+# All quarter-aligned lists in the dict returned by load_quarterly_from_db()/
+# download_ticker_quarterly() — kept as one named constant so trim_to_quarters
+# and anything else that needs to walk "every quarterly series at once"
+# (chart code, exports) all stay in sync if a field gets added later.
+QUARTERLY_LIST_FIELDS = [
+    "quarter_ends", "fiscal_years", "fiscal_quarters", "earnings_dates",
+    "prices", "eps_actual", "eps_estimate", "pe", "revenue", "net_income",
+    "gross_margin", "op_margin", "net_margin", "debt", "ocf", "capex", "fcf", "cash",
+    "price_react_pct",
+]
+
 
 def trim_to_years(d: dict, years_back: int) -> dict:
     """
@@ -1099,6 +1542,42 @@ def trim_to_years(d: dict, years_back: int) -> dict:
         if f in trimmed and isinstance(trimmed[f], list):
             trimmed[f] = trimmed[f][-years_back:]
     return trimmed
+
+
+def trim_to_quarters(d: dict, quarters_back: int) -> dict:
+    """
+    Quarterly twin of trim_to_years() — this is the "last N quarters"
+    display mode. The DB itself may hold years' worth of accumulated
+    history; this just slices what gets shown/charted, same way years_back
+    slices annual_data without ever touching what's actually stored.
+
+    For the other display mode — an explicit date range like "Q1 2025 to
+    Q4 2026" — don't use this at all; pass start=/end= straight into
+    load_quarterly_from_db() instead, since that's a DB-level filter rather
+    than a slice of an already-loaded dict.
+    """
+    trimmed = dict(d)
+    for f in QUARTERLY_LIST_FIELDS:
+        if f in trimmed and isinstance(trimmed[f], list):
+            trimmed[f] = trimmed[f][-quarters_back:]
+    return trimmed
+
+
+def quarter_label(quarter_end: str, fiscal_quarter=None, fiscal_year=None) -> str:
+    """
+    Human-readable axis label for a quarter_end date, e.g. "Q1 '25".
+    Falls back to deriving fiscal_quarter/fiscal_year from the date itself
+    (calendar-quarter approximation) if they weren't stored — good enough
+    for an axis label even though it may not match a company's actual
+    fiscal calendar for display purposes elsewhere.
+    """
+    d = dateutil.parser.parse(quarter_end)
+    if fiscal_quarter is None:
+        fiscal_quarter = (d.month - 1) // 3 + 1
+    if fiscal_year is None:
+        fiscal_year = d.year
+    return f"Q{fiscal_quarter} '{str(fiscal_year)[-2:]}"
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1123,12 +1602,12 @@ STYLE = {
 # needing to restart the app. Every explicit fontsize=/labelsize= literal in
 # the plotting code below is wrapped in fs(...) so the whole chart set scales
 # together, the same way the ticker picker and scorecard windows do.
-_CHART_FONT_SCALE = 100.0
+_CHART_FONT_SCALE = 110.0
 
 def refresh_chart_font_scale():
     global _CHART_FONT_SCALE
     _settings = app_settings.load_settings()
-    _CHART_FONT_SCALE = app_settings.get_float(_settings, "chart_font_scale", 100.0)
+    _CHART_FONT_SCALE = app_settings.get_float(_settings, "chart_font_scale", 110.0)
     return _CHART_FONT_SCALE
 
 def fs(base_size, minimum=6):
@@ -1478,6 +1957,8 @@ def plot_single_ticker(d, color, prefs=None):
     peg_str = f"  PEG {cur_peg:.2f}" if cur_peg else ""
 
     summary_parts = []
+    if price_cagr is not None:
+        summary_parts.append(f"Price CAGR: {price_cagr:+.1f}%")
     if rev_cagr is not None:
         summary_parts.append(f"Rev CAGR: {rev_cagr:+.1f}%")
     if eps_cagr_v is not None:
@@ -1500,6 +1981,322 @@ def plot_single_ticker(d, color, prefs=None):
                  ha="center", va="center", transform=ax_footer.transAxes,
                  fontsize=fs(9), fontweight="bold",
                  color="#1A1A2E", fontfamily="monospace")
+
+    return fig
+
+
+def eps_surprise_pct(actual_list, estimate_list):
+    """
+    Per-quarter EPS surprise %: (actual - estimate) / |estimate| * 100.
+    None where either side is missing or the estimate is exactly zero
+    (a zero estimate makes the % undefined, not just large).
+    """
+    out = []
+    for ea, ee in zip(actual_list, estimate_list):
+        if ea is None or ee is None or ee == 0:
+            out.append(None)
+        else:
+            out.append((ea - ee) / abs(ee) * 100.0)
+    return out
+
+
+def yoy_pct(values):
+    """
+    Quarter-over-same-quarter-last-year %, by index position (4 quarters
+    back). Returns None for the first 4 entries, or wherever either side
+    is missing/zero — same-quarter-last-year data only exists once the DB
+    has accumulated 5+ quarters for that symbol (download_ticker_quarterly
+    only ever pulls the live ~4-5 quarter window from yfinance per run, so
+    deeper history builds up over time via the append-only upsert).
+    """
+    out = [None] * len(values)
+    for i in range(4, len(values)):
+        cur, prior = values[i], values[i - 4]
+        if cur is None or prior is None or prior == 0:
+            continue
+        out[i] = (cur - prior) / abs(prior) * 100.0
+    return out
+
+
+def plot_quarterly_pulse(d, color):
+    """
+    The six-panel quarterly figure. `d` is whatever load_quarterly_from_db()
+    /trim_to_quarters() returns, with one addition the caller needs to make
+    first: d["name"] and d["symbol"] should be set (quarterly_data itself
+    has no name column — that lives only in the `tickers` table — so main()
+    should copy it over from the already-loaded annual dict before calling
+    this, the same way plot_single_ticker's `d` already carries it).
+    """
+    apply_style()
+    q_labels = [quarter_label(qe, fq, fy) for qe, fq, fy
+                in zip(d["quarter_ends"], d["fiscal_quarters"], d["fiscal_years"])]
+    x = np.arange(len(q_labels))
+    q_range = f"{q_labels[0]}–{q_labels[-1]}" if q_labels else ""
+
+    surprise_pct = eps_surprise_pct(d["eps_actual"], d["eps_estimate"])
+
+    fig = plt.figure(figsize=(16, 11), facecolor="white", dpi=100, layout="constrained")
+    fig.suptitle(f"{d.get('symbol','')} — {d.get('name','')}  |  Quarterly Pulse {q_range}",
+                 fontsize=fs(14), fontweight="bold")
+
+    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.22, wspace=0.40,
+                            height_ratios=[1, 1, 0.18])
+
+    # ── Panel 1: Price vs EPS Beat/Miss ──────────────────────────────────────
+    # Quarter-end close as a line, each point colour-coded by whether that
+    # quarter's EPS beat, missed, or had no estimate to compare against —
+    # so the panel reads as "did price actually agree with the earnings
+    # result" rather than the isolated reaction-% bar it used to be. Panel 2
+    # still shows actual vs. estimate EPS directly.
+    ax1, tbl1 = _make_panel_gridspec(fig, gs[0, 0])
+    ax1.set_axisbelow(True)
+    bar_colors = []
+    for ea, ee in zip(d["eps_actual"], d["eps_estimate"]):
+        if ea is None or ee is None:
+            bar_colors.append("#9CA3AF")     # no estimate to compare against
+        elif ea >= ee:
+            bar_colors.append("#10B981")     # beat or met
+        else:
+            bar_colors.append("#EF4444")     # miss
+    ax1.plot(x, clean(d["prices"]), color=color, linewidth=2, zorder=3)
+    ax1.scatter(x, clean(d["prices"]), c=bar_colors, s=70, zorder=5,
+                edgecolors="white", linewidth=0.8)
+
+    # Label each beat point with its EPS surprise % so a green dot reads
+    # as "beat, and by how much" without cross-referencing Panel 2.
+    prices_clean = clean(d["prices"])
+    y_span = (np.nanmax(prices_clean) - np.nanmin(prices_clean)) if len(prices_clean) else 0
+    y_offset = max(y_span * 0.06, 1.0)
+    for xi, price, bcolor, surp in zip(x, prices_clean, bar_colors, surprise_pct):
+        if bcolor == "#10B981" and surp is not None and not np.isnan(price):
+            ax1.annotate(f"+{surp:.0f}%", (xi, price + y_offset),
+                         ha="center", va="bottom", fontsize=fs(7),
+                         fontweight="bold", color="#10B981")
+
+    set_panel_title(ax1, "Price vs EPS Beat/Miss")
+    ax1.set_xticks(x); ax1.set_xticklabels(q_labels, fontsize=fs(8))
+    ax1.tick_params(axis="y", labelsize=fs(8))
+    legend1 = [
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="#10B981",
+               markersize=8, label="Beat / met"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="#EF4444",
+               markersize=8, label="Miss"),
+    ]
+    ax1.legend(handles=legend1, fontsize=fs(7))
+    beat_miss = []
+    for ea, ee in zip(d["eps_actual"], d["eps_estimate"]):
+        if ea is None or ee is None:
+            beat_miss.append("—")
+        else:
+            beat_miss.append("Beat" if ea >= ee else "Miss")
+    _draw_panel_table(tbl1, q_labels, [
+        ("Price ($)", color,     d["prices"],          lambda v: f"${v:,.2f}"),
+        ("React (%)", "#374151", d["price_react_pct"], lambda v: f"{v:+.1f}%"),
+        ("Result",    "#374151", beat_miss,             lambda v: v),
+    ])
+
+    # ── Panel 2: EPS — Actual vs Estimate ────────────────────────────────────
+    latest_surprise = latest(clean(surprise_pct))
+    title2_stat = f"Latest surprise {latest_surprise:+.1f}%" if not np.isnan(latest_surprise) else None
+    ax2, tbl2 = _make_panel_gridspec(fig, gs[0, 1])
+    ax2.set_axisbelow(True)
+    bw = 0.38
+    ax2.bar(x - bw/2, clean(d["eps_actual"]),   width=bw, color=color,
+            alpha=0.85, label="Actual")
+    ax2.bar(x + bw/2, clean(d["eps_estimate"]), width=bw, color="#9CA3AF",
+            alpha=0.70, label="Estimate")
+    set_panel_title(ax2, "EPS — Actual vs Estimate ($)", title2_stat)
+    ax2.set_xticks(x); ax2.set_xticklabels(q_labels, fontsize=fs(8))
+    ax2.tick_params(axis="y", labelsize=fs(8))
+    ax2.legend(fontsize=fs(7))
+    add_zero_line(ax2)
+    _draw_panel_table(tbl2, q_labels, [
+        ("Actual ($)",   color,     d["eps_actual"],   lambda v: f"${v:.2f}"),
+        ("Estimate ($)", "#6B7280", d["eps_estimate"], lambda v: f"${v:.2f}"),
+        ("Surprise (%)", "#9333EA", surprise_pct,      lambda v: f"{v:+.1f}%"),
+    ])
+
+    # ── Panel 3: Revenue, Net Income & Net Margin ────────────────────────────
+    rev_yoy = yoy_pct(d["revenue"])
+    latest_rev_yoy = latest(clean(rev_yoy))
+    title3_stat = f"Revenue YoY {latest_rev_yoy:+.1f}%" if not np.isnan(latest_rev_yoy) else None
+
+    ax3, tbl3 = _make_panel_gridspec(fig, gs[0, 2])
+    ax3.set_axisbelow(True)
+    ax3b = ax3.twinx()
+    ax3b.set_axisbelow(True)
+    ax3b.grid(False)
+
+    ax3.bar(x - bw/2, clean(d["revenue"]),    width=bw, color=color,
+            alpha=0.55, label="Revenue ($)")
+    ax3.bar(x + bw/2, clean(d["net_income"]), width=bw, color="#06B6D4",
+            alpha=0.80, label="Net Income ($)")
+    ax3b.plot(x, clean(d["net_margin"]), color="#F59E0B", linewidth=2,
+              marker="o", markersize=4)
+
+    set_panel_title(ax3, "Revenue, Net Income & Net Margin", title3_stat)
+    ax3.set_xticks(x); ax3.set_xticklabels(q_labels, fontsize=fs(8))
+    ax3.tick_params(axis="y", labelsize=fs(8))
+    apply_money_axis(ax3)
+    ax3b.tick_params(axis="y", labelsize=fs(8), colors="#F59E0B")
+    ax3b.set_ylabel("Net Margin %", fontsize=fs(8), color="#F59E0B")
+    legend3 = [
+        Line2D([0],[0], color=color,     linewidth=6, alpha=0.75, label="Revenue ($)"),
+        Line2D([0],[0], color="#06B6D4", linewidth=6, alpha=0.85, label="Net Income ($)"),
+        Line2D([0],[0], color="#F59E0B", linewidth=2,              label="Net Margin (%)"),
+    ]
+    ax3.legend(handles=legend3, fontsize=fs(7))
+    add_zero_line(ax3)
+    _draw_panel_table(tbl3, q_labels, [
+        ("Revenue ($)",    color,     d["revenue"],    lambda v: f"${v/1e6:,.0f}M"),
+        ("Net Inc. ($)",   "#06B6D4", d["net_income"], lambda v: f"${v/1e6:,.0f}M"),
+        ("Net Margin (%)", "#F59E0B", d["net_margin"], lambda v: f"{v:.1f}%"),
+        ("Rev YoY (%)",    "#7C3AED", rev_yoy,          lambda v: f"{v:+.1f}%"),
+    ])
+
+    # ── Panel 4: CapEx Intensity ──────────────────────────────────────────────
+    # CapitalExpenditure comes back from yfinance as a negative (cash
+    # outflow) — abs() it so the bar height and the intensity ratio both
+    # read the intuitive way ("capex is N% of OCF", not a negative %).
+    ax4, tbl4 = _make_panel_gridspec(fig, gs[1, 0])
+    ax4.set_axisbelow(True)
+    ax4b = ax4.twinx()
+    ax4b.set_axisbelow(True)
+    ax4b.grid(False)
+
+    capex_abs = [abs(v) if v is not None else None for v in d["capex"]]
+    intensity = []
+    for o, c in zip(d["ocf"], capex_abs):
+        intensity.append(round(c / o * 100, 1) if (o and c is not None) else None)
+
+    ax4.bar(x - bw/2, clean(d["ocf"]),    width=bw, color=color,
+            alpha=0.55, label="OCF ($)")
+    ax4.bar(x + bw/2, clean(capex_abs),   width=bw, color="#DC2626",
+            alpha=0.75, label="CapEx ($)")
+    ax4b.plot(x, clean(intensity), color="#7C3AED", linewidth=2,
+              marker="s", markersize=4)
+
+    latest_intensity = latest(clean(intensity))
+    title4_stat = f"Latest CapEx/OCF {latest_intensity:.0f}%" if not np.isnan(latest_intensity) else None
+    set_panel_title(ax4, "CapEx Intensity", title4_stat)
+    ax4.set_xticks(x); ax4.set_xticklabels(q_labels, fontsize=fs(8))
+    ax4.tick_params(axis="y", labelsize=fs(8))
+    apply_money_axis(ax4)
+    ax4b.tick_params(axis="y", labelsize=fs(8), colors="#7C3AED")
+    ax4b.set_ylabel("CapEx / OCF %", fontsize=fs(8), color="#7C3AED")
+    legend4 = [
+        Line2D([0],[0], color=color,     linewidth=6, alpha=0.75, label="OCF ($)"),
+        Line2D([0],[0], color="#DC2626", linewidth=6, alpha=0.85, label="CapEx ($)"),
+        Line2D([0],[0], color="#7C3AED", linewidth=2,              label="CapEx/OCF (%)"),
+    ]
+    ax4.legend(handles=legend4, fontsize=fs(7))
+    add_zero_line(ax4)
+    _draw_panel_table(tbl4, q_labels, [
+        ("OCF ($)",       color,     d["ocf"],   lambda v: f"${v/1e6:,.0f}M"),
+        ("CapEx ($)",     "#DC2626", capex_abs,  lambda v: f"${v/1e6:,.0f}M"),
+        ("CapEx/OCF (%)", "#7C3AED", intensity,  lambda v: f"{v:.0f}%"),
+    ])
+
+    # ── Panel 5: Debt Level & Coverage ───────────────────────────────────────
+    fcf_margin_q = []
+    for f, r in zip(d["fcf"], d["revenue"]):
+        fcf_margin_q.append(round(f / r * 100, 1) if (r and f is not None) else None)
+    latest_fcf_margin = latest(clean(fcf_margin_q))
+    title5_stat = f"FCF Margin {latest_fcf_margin:.1f}%" if not np.isnan(latest_fcf_margin) else None
+
+    ax5, tbl5 = _make_panel_gridspec(fig, gs[1, 1])
+    ax5.set_axisbelow(True)
+    tbw = 0.27
+    ax5.bar(x - tbw, clean(d["debt"]), width=tbw, color="#F472B6", alpha=0.85, label="Debt ($)")
+    ax5.bar(x,       clean(d["fcf"]),  width=tbw, color="#34D399", alpha=0.85, label="FCF ($)")
+    ax5.bar(x + tbw, clean(d["cash"]), width=tbw, color=color,     alpha=0.55, label="Cash ($)")
+
+    set_panel_title(ax5, "Debt Level & Coverage", title5_stat)
+    ax5.set_xticks(x); ax5.set_xticklabels(q_labels, fontsize=fs(8))
+    ax5.tick_params(axis="y", labelsize=fs(8))
+    apply_money_axis(ax5)
+    ax5.legend(fontsize=fs(7))
+    add_zero_line(ax5)
+    _draw_panel_table(tbl5, q_labels, [
+        ("Debt ($)", "#F472B6", d["debt"], lambda v: f"${v/1e6:,.0f}M"),
+        ("FCF ($)",  "#34D399", d["fcf"],  lambda v: f"${v/1e6:,.0f}M"),
+        ("Cash ($)", color,     d["cash"], lambda v: f"${v/1e6:,.0f}M"),
+        ("FCF Margin (%)", "#10B981", fcf_margin_q, lambda v: f"{v:.1f}%"),
+    ])
+
+    # ── Panel 6: P/E Trend, flagged for whether EPS actually held flat ──────
+    # Raw quarterly P/E is only a clean sentiment signal when EPS itself
+    # didn't move much that quarter — otherwise the ratio's confounded by
+    # the earnings denominator shifting too. The marker shape flags which
+    # case each point is, so a dip can be read as a real benchmark only
+    # when it's the filled-circle kind.
+    ax6, tbl6 = _make_panel_gridspec(fig, gs[1, 2])
+    ax6.plot(x, clean(d["pe"]), color=color, linewidth=2, zorder=3)
+
+    eps_qoq = [None]
+    for i in range(1, len(d["eps_actual"])):
+        prev, cur = d["eps_actual"][i - 1], d["eps_actual"][i]
+        if prev and cur is not None:
+            eps_qoq.append(round((cur - prev) / abs(prev) * 100, 1))
+        else:
+            eps_qoq.append(None)
+
+    STABLE_THRESHOLD = 5.0  # EPS QoQ% within ±5% counts as "fundamentals held"
+    for xi, pe_val, qoq in zip(x, d["pe"], eps_qoq):
+        if pe_val is None:
+            continue
+        stable = qoq is not None and abs(qoq) <= STABLE_THRESHOLD
+        ax6.scatter([xi], [pe_val], marker="o" if stable else "x",
+                    s=70, zorder=5,
+                    color="#10B981" if stable else "#9CA3AF")
+
+    set_panel_title(ax6, "P/E Trend")
+    ax6.set_xticks(x); ax6.set_xticklabels(q_labels, fontsize=fs(8))
+    ax6.tick_params(axis="y", labelsize=fs(8))
+    legend6 = [
+        Line2D([0],[0], color=color, linewidth=2, label="P/E"),
+        Line2D([0],[0], marker="o", color="w", markerfacecolor="#10B981",
+               markersize=8, label="EPS held flat"),
+        Line2D([0],[0], marker="x", color="#9CA3AF", markersize=8,
+               linestyle="None", label="EPS also moved"),
+    ]
+    ax6.legend(handles=legend6, fontsize=fs(7))
+    add_zero_line(ax6)
+    _draw_panel_table(tbl6, q_labels, [
+        ("P/E",         color,     d["pe"], lambda v: f"{v:.1f}x"),
+        ("EPS QoQ (%)", "#374151", eps_qoq, lambda v: f"{v:+.1f}%"),
+    ])
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    latest_pe   = latest(d["pe"])
+    latest_nm   = latest(d["net_margin"])
+    latest_reac = latest(d["price_react_pct"])
+
+    def avg_last_n(values, n):
+        vals = [v for v in values if v is not None and not (isinstance(v, float) and np.isnan(v))]
+        subset = vals[-n:]
+        return round(sum(subset) / len(subset), 1) if subset else None
+
+    avg_pe_q = avg_last_n(d["pe"], 5)
+    avg_nm_q = avg_last_n(d["net_margin"], 5)
+
+    summary_parts = [f"{len(q_labels)} quarter(s) on file"]
+    if not np.isnan(latest_pe):
+        summary_parts.append(f"Latest P/E: {latest_pe:.1f}x")
+    if avg_pe_q is not None:
+        summary_parts.append(f"Avg P/E: {avg_pe_q:.1f}x")
+    if not np.isnan(latest_nm):
+        summary_parts.append(f"Latest Net Margin: {latest_nm:.1f}%")
+    if avg_nm_q is not None:
+        summary_parts.append(f"Avg Net Margin: {avg_nm_q:.1f}%")
+    if not np.isnan(latest_reac):
+        summary_parts.append(f"Latest Reaction: {latest_reac:+.1f}%")
+
+    ax_footer = fig.add_subplot(gs[2, :])
+    ax_footer.axis("off")
+    ax_footer.text(0.5, 0.5, "  |  ".join(summary_parts),
+             ha="center", va="center", transform=ax_footer.transAxes,
+             fontsize=fs(9), fontweight="bold", color="#1A1A2E", fontfamily="monospace")
 
     return fig
 
@@ -1718,7 +2515,7 @@ def plot_etf(etf_list, colors, years_back):
 def export_session(stock_list, stock_colors, etf_list, etf_colors,
                    figs_stock_single, fig_comparison, fig_snapshot,
                    fig_etf, fig_etf_table, fig_growth_table, fig_valuation_table,
-                   years_back):
+                   years_back, quarterly_pairs=None, quarterly_table_data=None):
     today = datetime.now().strftime("%Y-%m-%d")
     out   = make_session_folder(stock_list, etf_list)
     saved = []
@@ -1735,7 +2532,7 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
             return round(sum(subset) / len(subset), 2) if subset else None
 
         fieldnames = [
-            "symbol", "name", "price",
+            "symbol", "name", "price", "price_cagr_full",
             # Growth
             "eps_cagr_full", "eps_cagr_3yr", "eps_cagr_5yr",
             "rev_cagr_3yr", "rev_cagr_5yr",
@@ -1784,6 +2581,7 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
                     "symbol":  d["symbol"],
                     "name":    d["name"],
                     "price":   d.get("current_price"),
+                    "price_cagr_full": cagr_full_window(d["prices"], d["years"]),
                     "eps_cagr_full": cagr_full_window(d["eps"], d["years"]),
                     "eps_cagr_3yr":  cagr_pct(d["eps"], 3),
                     "eps_cagr_5yr":  cagr_pct(d["eps"], 5),
@@ -1814,6 +2612,98 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
                     "fcfps_3yr_avg":   avg_last_n(d["fcfps"], 3),
                 })
         saved.append(f"{today}_scorecard.csv")
+
+    if quarterly_table_data:
+        # ── Quarterly scorecard CSV — every metric from both quarterly
+        # on-screen tables (Earnings Quality + Cash/Capital Intensity/
+        # Valuation), one file, mirroring how the yearly scorecard.csv
+        # combines its two tables above.
+        path = os.path.join(out, f"{today}_quarterly_scorecard.csv")
+
+        q_fieldnames = [
+            "symbol", "name", "latest_quarter",
+            "eps_surprise_pct", "beats", "beats_out_of",
+            "revenue_yoy_pct",
+            "net_margin_latest", "net_margin_5q_avg",
+            "fcf_margin_latest", "capex_ocf_pct_latest",
+            "pe_latest", "pe_5q_avg",
+            "price_reaction_pct_latest",
+        ]
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=q_fieldnames)
+            writer.writeheader()
+            for d in quarterly_table_data:
+                eps_actual   = d.get("eps_actual", [])
+                eps_estimate = d.get("eps_estimate", [])
+                revenue      = d.get("revenue", [])
+                fcf          = d.get("fcf", [])
+                ocf          = d.get("ocf", [])
+                capex        = d.get("capex", [])
+                net_margin   = d.get("net_margin", [])
+                pe           = d.get("pe", [])
+                reaction     = d.get("price_react_pct", [])
+
+                surprise_series = []
+                for ea, ee in zip(eps_actual, eps_estimate):
+                    if ea is None or ee is None or ee == 0:
+                        surprise_series.append(None)
+                    else:
+                        surprise_series.append(round((ea - ee) / abs(ee) * 100.0, 2))
+                lat_surprise = latest(clean(surprise_series))
+
+                compared = [(ea, ee) for ea, ee in zip(eps_actual, eps_estimate)
+                            if ea is not None and ee is not None]
+                beats      = sum(1 for ea, ee in compared if ea >= ee) if compared else None
+                beats_of_n = len(compared) if compared else None
+
+                yoy_series = [None] * len(revenue)
+                for i in range(4, len(revenue)):
+                    cur, prior = revenue[i], revenue[i - 4]
+                    if cur is not None and prior is not None and prior != 0:
+                        yoy_series[i] = round((cur - prior) / abs(prior) * 100.0, 2)
+                lat_yoy = latest(clean(yoy_series))
+
+                fcf_margin_series = []
+                for fv, rv in zip(fcf, revenue):
+                    fcf_margin_series.append(round(fv / rv * 100.0, 2) if (rv and fv is not None) else None)
+                lat_fcf_margin = latest(clean(fcf_margin_series))
+
+                intensity_series = []
+                for o, c in zip(ocf, capex):
+                    c_abs = abs(c) if c is not None else None
+                    intensity_series.append(round(c_abs / o * 100.0, 1) if (o and c_abs is not None) else None)
+                lat_intensity = latest(clean(intensity_series))
+
+                q_ends = d.get("quarter_ends", [])
+                fq     = d.get("fiscal_quarters", [])
+                fy     = d.get("fiscal_years", [])
+                latest_q_label = (f"Q{fq[-1]} '{str(fy[-1])[-2:]}"
+                                  if q_ends and fq and fy else None)
+
+                lat_nm  = latest(clean(net_margin))
+                avg_nm  = avg_last_n(net_margin, 5)
+                lat_pe  = latest(clean(pe))
+                avg_pe  = avg_last_n(pe, 5)
+                lat_rxn = latest(clean(reaction))
+
+                writer.writerow({
+                    "symbol": d.get("symbol", ""),
+                    "name":   d.get("name", ""),
+                    "latest_quarter": latest_q_label,
+                    "eps_surprise_pct": None if np.isnan(lat_surprise) else lat_surprise,
+                    "beats": beats,
+                    "beats_out_of": beats_of_n,
+                    "revenue_yoy_pct": None if np.isnan(lat_yoy) else lat_yoy,
+                    "net_margin_latest": None if np.isnan(lat_nm) else lat_nm,
+                    "net_margin_5q_avg": avg_nm,
+                    "fcf_margin_latest": None if np.isnan(lat_fcf_margin) else lat_fcf_margin,
+                    "capex_ocf_pct_latest": None if np.isnan(lat_intensity) else lat_intensity,
+                    "pe_latest": None if np.isnan(lat_pe) else lat_pe,
+                    "pe_5q_avg": avg_pe,
+                    "price_reaction_pct_latest": None if np.isnan(lat_rxn) else lat_rxn,
+                })
+        saved.append(f"{today}_quarterly_scorecard.csv")
 
     if stock_list:
         path = os.path.join(out, f"{today}_ticker_detail.csv")
@@ -1934,6 +2824,11 @@ def export_session(stock_list, stock_colors, etf_list, etf_colors,
 
     for d, fig in zip(stock_list, figs_stock_single):
         fname = f"{today}_{d['symbol']}.png"
+        fig.savefig(os.path.join(out, fname), dpi=150, bbox_inches="tight")
+        saved.append(fname)
+
+    for symbol, fig in (quarterly_pairs or []):
+        fname = f"{today}_{symbol}_quarterly.png"
         fig.savefig(os.path.join(out, fname), dpi=150, bbox_inches="tight")
         saved.append(fname)
 
@@ -2120,6 +3015,11 @@ def main():
         "force_refresh": False,
         "do_export":     False,
         "show_charts":   True,
+        "show_quarterly": False,
+        "quarterly_mode": "last_n",
+        "quarters_back":  8,
+        "quarter_start":  None,
+        "quarter_end":    None,
     }
 
     selected, YEARS_BACK, force_refresh, do_export, \
@@ -2153,6 +3053,44 @@ def main():
         print_db_summary(conn)
         print()
 
+        # Re-read each iteration (not just once before the loop) for the same
+        # reason do_show already is below — _run_state can change between
+        # "Run Again" cycles on the same window.
+        show_quarterly = _run_state.get("show_quarterly", False)
+        quarterly_mode = _run_state.get("quarterly_mode", "last_n")
+        quarters_back  = _run_state.get("quarters_back", 8)
+        quarter_start  = _run_state.get("quarter_start")
+        quarter_end    = _run_state.get("quarter_end")
+        quarterly_map  = {}   # symbol -> quarterly dict, filled in below
+
+        def fetch_quarterly(sym):
+            """
+            Stock-only — never call this for an ETF symbol. Refreshes this
+            symbol's quarterly history if it's due (or force_refresh is on),
+            then loads whatever's accumulated in the DB (filtered by the
+            chosen display mode) into quarterly_map, keyed by symbol so the
+            chart-building step below can look it up against stock_list
+            without needing index-aligned parallel lists.
+            """
+            if not show_quarterly:
+                return
+            try:
+                if force_refresh or is_quarter_stale(conn, sym):
+                    log(f"  \u2193 {sym}  downloading (quarterly)\u2026")
+                    qd = download_ticker_quarterly(sym)
+                    if qd:
+                        upsert_quarterly(conn, qd)
+                        log(f"  \u2714 {sym}  quarterly saved")
+                    else:
+                        log(f"  \u2716 {sym}  quarterly download failed")
+                q_loaded = load_quarterly_from_db(conn, sym, start=quarter_start, end=quarter_end)
+                if q_loaded:
+                    if quarterly_mode == "last_n":
+                        q_loaded = trim_to_quarters(q_loaded, quarters_back)
+                    quarterly_map[sym] = q_loaded
+            except Exception as e:
+                log(f"  \u2716 {sym}  quarterly error: {e}")
+
         stock_list, stock_colors = [], []
         etf_list,   etf_colors   = [], []
 
@@ -2174,6 +3112,7 @@ def main():
                     log(f"  \u2714 {sym}  loaded from DB")
                     stock_list.append(trim_to_years(cached, YEARS_BACK))
                     stock_colors.append(col)
+                    fetch_quarterly(sym)
                     continue
 
                 log(f"  \u2193 {sym}  downloading\u2026")
@@ -2197,6 +3136,7 @@ def main():
                         merged = load_ticker_from_db(conn, sym)
                         stock_list.append(trim_to_years(merged if merged else d, YEARS_BACK))
                         stock_colors.append(col)
+                        fetch_quarterly(sym)
                         log(f"  \u2714 {sym}  saved")
                     else:
                         log(f"  \u2716 {sym}  download failed")
@@ -2227,6 +3167,9 @@ def main():
         apply_style()
         chart_prefs        = load_chart_prefs()
         figs_stock_single   = []
+        figs_quarterly       = []
+        quarterly_export_pairs = []   # (symbol, fig) — export_session needs the symbol too
+        quarterly_table_data   = []   # per-symbol quarterly dicts, for the two quarterly scorecards
         fig_growth_table    = None   # interactive Tk window, not a matplotlib fig — stays None
         fig_valuation_table = None   # same
         fig_comparison      = None
@@ -2241,11 +3184,30 @@ def main():
                 fig.canvas.manager.set_window_title(f"{d['symbol']} \u2014 {d['name']}")
                 figs_stock_single.append(fig)
 
+                if show_quarterly:
+                    q_data = quarterly_map.get(d["symbol"])
+                    if q_data:
+                        q_data["name"] = d.get("name", d["symbol"])
+                        log(f"  Chart: {d['symbol']} (Quarterly Pulse)")
+                        fig_q = plot_quarterly_pulse(q_data, col)
+                        fig_q.canvas.manager.set_window_title(f"{d['symbol']} \u2014 Quarterly Pulse")
+                        figs_quarterly.append(fig_q)
+                        quarterly_export_pairs.append((d["symbol"], fig_q))
+                        quarterly_table_data.append(q_data)
+                    else:
+                        log(f"  \u2014 {d['symbol']}  no quarterly data to chart")
+
             if stock_list:
                 log("  Table: Scorecard — Growth & Quality")
                 show_stock_table_growth(stock_list, stock_colors, YEARS_BACK)
                 log("  Table: Scorecard — Valuation, Balance Sheet & Capital Return")
                 show_stock_table_valuation(stock_list, stock_colors, YEARS_BACK)
+
+            if show_quarterly and quarterly_table_data:
+                log("  Table: Quarterly Scorecard — Earnings Quality")
+                show_stock_table_quarterly_earnings(quarterly_table_data, stock_colors)
+                log("  Table: Quarterly Scorecard — Cash, Capital Intensity & Valuation")
+                show_stock_table_quarterly_valuation(quarterly_table_data, stock_colors)
 
             if len(stock_list) > 1:
                 log("  Chart: Comparison")
@@ -2262,7 +3224,7 @@ def main():
                 log("  Table: ETF Scorecard")
                 show_etf_table(etf_list, etf_colors, YEARS_BACK)
 
-        figs = figs_stock_single[:]
+        figs = figs_stock_single[:] + figs_quarterly
         for f in [fig_growth_table, fig_valuation_table, fig_comparison,
                   fig_snapshot, fig_etf, fig_etf_table]:
             if f is not None:
@@ -2274,7 +3236,8 @@ def main():
                 stock_list, stock_colors, etf_list, etf_colors,
                 figs_stock_single, fig_comparison, fig_snapshot,
                 fig_etf, fig_etf_table, fig_growth_table, fig_valuation_table,
-                YEARS_BACK,
+                YEARS_BACK, quarterly_export_pairs,
+                quarterly_table_data=quarterly_table_data,
             )
             log(f"  \u2714 {len(saved)} files \u2192 {session_folder}")
 
@@ -2339,6 +3302,49 @@ def is_stale(conn, symbol, years_back, days=90):
         parsed = parsed.replace(tzinfo=None)
     age = datetime.now() - parsed
     return age.total_seconds() > days * 86400
+
+
+def is_quarter_stale(conn, symbol, days=21):
+    """
+    Quarterly equivalent of is_stale(). Deliberately checks far more often
+    than the annual 90-day window — a new quarter is reported roughly every
+    ~90 days, so reusing that same window would mean we'd often sit on a
+    stale local copy for weeks after a fresh print actually landed. A
+    shorter window catches it within a few runs instead.
+
+    This only governs whether we bother re-fetching. Once we do,
+    upsert_quarterly() never deletes existing rows — it only adds rows for
+    quarter_end dates not already present. So an over-eager stale check
+    just costs an extra yfinance call; an under-eager one just means
+    catching a new quarter a little later. Neither ever loses history.
+    """
+    row = conn.execute(
+        "SELECT consensus FROM tickers WHERE symbol = ?", (symbol,)
+    ).fetchone()
+    if not row:
+        return True
+    if row["consensus"] == "ETF":
+        return False  # quarterly income statements aren't meaningful for ETFs
+
+    latest = conn.execute(
+        "SELECT quarter_end, last_updated FROM quarterly_data "
+        "WHERE symbol = ? ORDER BY quarter_end DESC LIMIT 1",
+        (symbol,)
+    ).fetchone()
+    if not latest:
+        return True
+
+    parsed = dateutil.parser.parse(latest["last_updated"])
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    if (datetime.now() - parsed).total_seconds() > days * 86400:
+        return True
+
+    # Belt-and-suspenders: if the newest quarter on file is itself already
+    # ~100+ days old, a new one has almost certainly been reported by now
+    # regardless of when we last checked — don't wait for the timer above.
+    q_end = dateutil.parser.parse(latest["quarter_end"])
+    return (datetime.now() - q_end).days > 100
 
 
 if __name__ == "__main__":

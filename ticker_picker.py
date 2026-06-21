@@ -1959,19 +1959,164 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     tk.Label(ctrl, textvariable=count_var, bg=CLR_BG,
              fg=CLR_SUBTEXT, font=mono).pack(side="left", padx=14)
 
-    years_frame = tk.Frame(ctrl, bg=CLR_BG)
-    years_frame.pack(side="left", padx=(0, 14))
-    tk.Label(years_frame, text="History:", bg=CLR_BG,
-             fg=CLR_SUBTEXT, font=bold).pack(side="left", padx=(0, 6))
+    # ── History section (own labeled row, 2026-06-22 redesign) ───────────────
+    # Previously "History: __ yrs" lived inline in the bottom action bar, and
+    # "Quarterly" was a toggle button further along the SAME bar — clicking it
+    # revealed a sub-row that grew the bar wide enough to push the Quarterly
+    # checkbox itself off-window (no way to find it again to switch back off).
+    # Pulled into its own full-width row, with the quarterly controls always
+    # present (dimmed, not hidden) so nothing can crowd anything else off-screen.
+    history_frame = tk.Frame(root, bg=CLR_BG, pady=8, padx=14,
+                              highlightthickness=1, highlightbackground="#DCE3EC")
+    history_frame.pack(side="bottom", fill="x")
+
+    tk.Label(history_frame, text="History", bg=CLR_BG, fg=CLR_SUBTEXT,
+             font=bold).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+
+    tk.Label(history_frame, text="Annual:", bg=CLR_BG,
+             fg=CLR_TEXT, font=bold).grid(row=1, column=0, sticky="w", padx=(0, 6))
     years_var = tk.StringVar(value=str(_years_default))
     _dialog_state["years_var"] = years_var
-    tk.Entry(years_frame, textvariable=years_var, font=mono,
-             width=4, relief="flat",
-             highlightthickness=1,
+    tk.Entry(history_frame, textvariable=years_var, font=mono,
+             width=4, relief="flat", highlightthickness=1,
              highlightcolor=CLR_ACCENT,
-             highlightbackground="#CCCCCC").pack(side="left")
-    tk.Label(years_frame, text="yrs", bg=CLR_BG,
-             fg=CLR_SUBTEXT, font=mono).pack(side="left", padx=(4, 0))
+             highlightbackground="#CCCCCC").grid(row=1, column=1, sticky="w")
+    tk.Label(history_frame, text="yrs", bg=CLR_BG,
+             fg=CLR_SUBTEXT, font=mono).grid(row=1, column=2, sticky="w", padx=(4, 0))
+
+    quarterly_var = tk.BooleanVar(value=False)
+    q_mode_var    = tk.StringVar(value="last_n")
+    # Default quarters now follows years (yrs * 4) instead of a flat literal,
+    # so "History: 4 yrs" and "Quarterly: 16 qtrs" agree with each other.
+    quarters_var  = tk.StringVar(value=str(max(1, int(_years_default)) * 4))
+    q_start_var   = tk.StringVar(value="")
+    q_end_var     = tk.StringVar(value="")
+    _q_linked     = {"on": True}   # False once the user hand-edits the qtrs box
+
+    q_check_container = tk.Frame(history_frame, bg=CLR_BG)
+    q_check_container.grid(row=1, column=3, sticky="w", padx=(20, 0))
+    q_check_btn = tk.Button(q_check_container,
+                             text="☑" if quarterly_var.get() else "☐",
+                             font=tick_font,
+                             fg=CLR_ACCENT if quarterly_var.get() else "#AAAAAA",
+                             bg=CLR_BG, activebackground=CLR_BG,
+                             relief="flat", bd=0, cursor="hand2", padx=0, pady=0)
+    q_check_btn.pack(side="left")
+    tk.Label(q_check_container, text="Also show quarterly:", bg=CLR_BG,
+             fg=CLR_TEXT, font=bold).pack(side="left")
+
+    def _toggle_quarterly():
+        quarterly_var.set(not quarterly_var.get())
+        q_check_btn.config(text="☑" if quarterly_var.get() else "☐",
+                            fg=CLR_ACCENT if quarterly_var.get() else "#AAAAAA")
+        _refresh_q_mode_rows()
+
+    q_check_btn.config(command=_toggle_quarterly)
+
+    q_controls = tk.Frame(history_frame, bg=CLR_BG)
+    q_controls.grid(row=1, column=4, columnspan=2, sticky="w", padx=(10, 0))
+
+    q_last_n_row = tk.Frame(q_controls, bg=CLR_BG)
+    q_range_row  = tk.Frame(q_controls, bg=CLR_BG)
+
+    q_last_n_radio = tk.Radiobutton(q_last_n_row, variable=q_mode_var, value="last_n",
+                                     bg=CLR_BG, activebackground=CLR_BG, selectcolor="#D0EEFF")
+    q_last_n_radio.pack(side="left")
+    quarters_entry = tk.Entry(q_last_n_row, textvariable=quarters_var, font=mono,
+                               width=3, relief="flat", highlightthickness=1,
+                               highlightcolor=CLR_ACCENT, highlightbackground="#CCCCCC")
+    quarters_entry.pack(side="left")
+    q_last_n_label = tk.Label(q_last_n_row, text="last qtrs", bg=CLR_BG,
+                               fg=CLR_SUBTEXT, font=mono)
+    q_last_n_label.pack(side="left", padx=(4, 10))
+    q_linked_hint = tk.Label(q_last_n_row, text="(= yrs \u00d7 4)", bg=CLR_BG,
+                              fg="#AAAAAA", font=mono)
+    q_linked_hint.pack(side="left")
+
+    q_range_radio = tk.Radiobutton(q_range_row, variable=q_mode_var, value="range",
+                                    bg=CLR_BG, activebackground=CLR_BG, selectcolor="#D0EEFF")
+    q_range_radio.pack(side="left")
+    q_start_entry = tk.Entry(q_range_row, textvariable=q_start_var, font=mono,
+                              width=8, relief="flat", highlightthickness=1,
+                              highlightcolor=CLR_ACCENT, highlightbackground="#CCCCCC")
+    q_start_entry.pack(side="left")
+    tk.Label(q_range_row, text="to", bg=CLR_BG,
+             fg=CLR_SUBTEXT, font=mono).pack(side="left", padx=3)
+    q_end_entry = tk.Entry(q_range_row, textvariable=q_end_var, font=mono,
+                            width=8, relief="flat", highlightthickness=1,
+                            highlightcolor=CLR_ACCENT, highlightbackground="#CCCCCC")
+    q_end_entry.pack(side="left")
+    q_range_hint = tk.Label(q_range_row, text="(YYYY-Q#)", bg=CLR_BG,
+                             fg=CLR_SUBTEXT, font=mono)
+    q_range_hint.pack(side="left", padx=(4, 10))
+
+    def _set_q_enabled(enabled: bool):
+        """Grey out / re-enable whichever quarterly sub-row is showing.
+        Never hides q_controls itself — that's what reserves its space."""
+        state = "normal" if enabled else "disabled"
+        for w in (q_last_n_radio, q_range_radio, quarters_entry,
+                  q_start_entry, q_end_entry):
+            w.config(state=state)
+        dim = CLR_SUBTEXT if enabled else "#CCCCCC"
+        q_last_n_label.config(fg=dim)
+        q_range_hint.config(fg=dim)
+
+    def _refresh_q_mode_rows():
+        q_last_n_row.pack_forget()
+        q_range_row.pack_forget()
+        if q_mode_var.get() == "last_n":
+            q_last_n_row.pack(side="left")
+        else:
+            q_range_row.pack(side="left")
+        _set_q_enabled(quarterly_var.get())
+
+    q_last_n_radio.config(command=_refresh_q_mode_rows)
+    q_range_radio.config(command=_refresh_q_mode_rows)
+
+    def _break_quarters_link(event=None):
+        if _q_linked["on"]:
+            _q_linked["on"] = False
+            q_linked_hint.pack_forget()
+
+    quarters_entry.bind("<Key>", _break_quarters_link)
+
+    def _on_years_change(*_args):
+        if _q_linked["on"]:
+            try:
+                quarters_var.set(str(max(1, int(years_var.get())) * 4))
+            except ValueError:
+                pass
+
+    years_var.trace_add("write", _on_years_change)
+    _refresh_q_mode_rows()   # paint initial (disabled) state
+
+    def _parse_quarter_bound(s: str, end: bool = False):
+        """
+        'YYYY-Q#' (or plain 'YYYY') → an ISO date bound matching the
+        quarter_end column's format, so this can be passed straight into
+        load_quarterly_from_db(start=, end=) with no further parsing on
+        the main.py side. Returns None for blank/unparseable input —
+        load_quarterly_from_db() treats None as "no bound".
+        """
+        s = s.strip().upper()
+        if not s:
+            return None
+        try:
+            if "Q" in s:
+                year_part, q_part = s.split("Q")
+                year = int(year_part.strip("-").strip())
+                q    = max(1, min(4, int(q_part.strip())))
+            else:
+                year = int(s)
+                q    = 4 if end else 1
+            if end:
+                month = q * 3
+                day   = 31 if month in (3, 12) else 30
+                return f"{year:04d}-{month:02d}-{day:02d}"
+            month = (q - 1) * 3 + 1
+            return f"{year:04d}-{month:02d}-01"
+        except Exception:
+            return None
 
     refresh_var     = tk.BooleanVar(value=False)
     export_var      = tk.BooleanVar(value=False)
@@ -1999,6 +2144,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         search_frame.pack_forget()
         list_outer.pack_forget()
         ctrl.pack_forget()
+        history_frame.pack_forget()
         status_panel.pack(fill="both", expand=True)
         root.geometry(_saved_geometry)
         root.update_idletasks()
@@ -2008,9 +2154,17 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
             _run_state["force_refresh"] = result_refresh
             _run_state["do_export"]     = result_export
             _run_state["show_charts"]   = show_charts_var.get()
+            _run_state["show_quarterly"] = quarterly_var.get()
+            _run_state["quarterly_mode"] = q_mode_var.get()
+            try:
+                _run_state["quarters_back"] = max(1, int(quarters_var.get()))
+            except ValueError:
+                _run_state["quarters_back"] = 8
+            _run_state["quarter_start"] = _parse_quarter_bound(q_start_var.get(), end=False)
+            _run_state["quarter_end"]   = _parse_quarter_bound(q_end_var.get(),   end=True)
         root.quit()
 
-    def _make_toggle_btn(frame, label, var, side="right", padx=(0, 8)):
+    def _make_toggle_btn(frame, label, var, side="right", padx=(0, 8), on_toggle=None):
         container = tk.Frame(frame, bg=CLR_BG)
         container.pack(side=side, padx=padx)
         btn = tk.Button(container,
@@ -2027,6 +2181,8 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
             var.set(not var.get())
             btn.config(text="☑" if var.get() else "☐",
                        fg=CLR_ACCENT if var.get() else "#AAAAAA")
+            if on_toggle:
+                on_toggle()
 
         btn.config(command=_toggle)
 
@@ -2039,8 +2195,8 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
 
     # ── Fit window width to actual content ─────────────────────────────────
     # WINDOW_WIDTH (1600) is only a starting guess. The bottom control bar
-    # (Select All / Clear All / History / Export files / Re-download /
-    # Show charts / Go) and the watchlist bar are the two rows most likely
+    # (Select All / Clear All / Export files / Re-download / Show charts / Go),
+    # the History section, and the watchlist bar are the rows most likely
     # to overflow or leave a big empty gap, since every other row wraps or
     # scrolls. Measure their real required width now that every button in
     # them has been packed, and resize the window to fit — clamped to the
@@ -2049,6 +2205,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     _content_w = max(
         ctrl.winfo_reqwidth(),
         wl_frame.winfo_reqwidth(),
+        history_frame.winfo_reqwidth(),
     )
     _margin = 40
     _desired_w = _content_w + _margin
@@ -2114,6 +2271,17 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         refresh_var.set(False)
         export_var.set(False)
         show_charts_var.set(True)
+        quarterly_var.set(False)
+        q_mode_var.set("last_n")
+        q_start_var.set("")
+        q_end_var.set("")
+        _q_linked["on"] = True
+        q_linked_hint.pack(side="left")   # re-show in case a prior edit hid it
+        try:
+            quarters_var.set(str(max(1, int(years_var.get())) * 4))
+        except ValueError:
+            quarters_var.set("8")
+        _refresh_q_mode_rows()
         log_text.delete("1.0", "end")
         status_title_var.set("Loading…")
         hdr.pack(fill="x")
@@ -2123,6 +2291,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         search_frame.pack(fill="x")
         list_outer.pack(fill="both", expand=True)
         ctrl.pack(fill="x")
+        history_frame.pack(side="bottom", fill="x")
         root.geometry(_saved_geo)
         root.update_idletasks()
         # Re-enter mainloop on the SAME window so user can pick again.
