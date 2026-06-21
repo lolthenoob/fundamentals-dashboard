@@ -2290,7 +2290,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         toggle_frame.pack(fill="x")
         search_frame.pack(fill="x")
         list_outer.pack(fill="both", expand=True)
-        ctrl.pack(fill="x")
+        ctrl.pack(side="bottom", fill="x")
         history_frame.pack(side="bottom", fill="x")
         root.geometry(_saved_geo)
         root.update_idletasks()
