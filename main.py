@@ -1383,15 +1383,33 @@ def add_zero_line(ax):
 def cagr_pct(values, n_years):
     """
     Fixed-window CAGR over the most recent n_years. Returns None if there
-    isn't n_years+1 of clean history or the start value isn't usable.
+    isn't n_years+1 of clean history. Mirrors cagr_full_window's handling
+    of negative/zero-crossing values: same-sign-negative uses a sign-aware
+    magnitude rate, and a zero-crossing window gets shifted positive using
+    the same fixed, data-derived shift trick (here min(start, end) is the
+    relevant minimum, since this function only ever sees those two points).
     """
     clean_vals = [v for v in values if v is not None]
     if len(clean_vals) < n_years + 1:
         return None
+
     end, start = clean_vals[-1], clean_vals[-(n_years + 1)]
-    if start is None or end is None or start <= 0:
+    if start == 0 or end == 0:
         return None
-    return round(((end / start) ** (1 / n_years) - 1) * 100, 2)
+
+    if start > 0 and end > 0:
+        return round(((end / start) ** (1 / n_years) - 1) * 100, 2)
+
+    if start < 0 and end < 0:
+        mag_rate = ((abs(end) / abs(start)) ** (1 / n_years) - 1) * 100
+        return round(-mag_rate, 2)
+
+    # crossed zero — same shift approach as cagr_full_window
+    shift = abs(min(start, end)) + 1
+    shifted_start, shifted_end = start + shift, end + shift
+    if shifted_start <= 0:
+        return None
+    return round(((shifted_end / shifted_start) ** (1 / n_years) - 1) * 100, 2)
 
 
 def cagr_full_window(values, years_list):
@@ -2414,7 +2432,7 @@ def cagr(prices, n):
         return None
     end   = clean_prices[-1]
     start = clean_prices[-(n + 1)]
-    if start is None or end is None or start <= 0:
+    if start is None or end is None or start <= 0 or end <= 0:
         return None
     return round(((end / start) ** (1 / n) - 1) * 100, 2)
 

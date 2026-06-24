@@ -63,17 +63,31 @@ def _avg_last_n(values, n):
 
 def _cagr_pct(values, n_years):
     """
-    Generic CAGR helper, shared logic for price/eps/revenue/fcf/bvps CAGR.
-    Looks back n_years from the end of the list. Returns None if there
-    isn't enough clean history or the start value isn't usable.
+    Fixed-window CAGR over the most recent n_years. Returns None if there
+    isn't n_years+1 of clean history. Mirrors cagr_full_window's handling
+    of negative/zero-crossing values.
     """
-    clean = [v for v in values if v is not None]
-    if len(clean) < n_years + 1:
+    clean_vals = [v for v in values if v is not None]
+    if len(clean_vals) < n_years + 1:
         return None
-    end, start = clean[-1], clean[-(n_years + 1)]
-    if start is None or end is None or start <= 0:
+
+    end, start = clean_vals[-1], clean_vals[-(n_years + 1)]
+    if start == 0 or end == 0:
         return None
-    return round(((end / start) ** (1 / n_years) - 1) * 100, 2)
+
+    if start > 0 and end > 0:
+        return round(((end / start) ** (1 / n_years) - 1) * 100, 2)
+
+    if start < 0 and end < 0:
+        mag_rate = ((abs(end) / abs(start)) ** (1 / n_years) - 1) * 100
+        return round(-mag_rate, 2)
+
+    # crossed zero — same shift approach as cagr_full_window
+    shift = abs(min(start, end)) + 1
+    shifted_start, shifted_end = start + shift, end + shift
+    if shifted_start <= 0:
+        return None
+    return round(((shifted_end / shifted_start) ** (1 / n_years) - 1) * 100, 2)
 
 
 def _cagr_full_window(values, years_list):

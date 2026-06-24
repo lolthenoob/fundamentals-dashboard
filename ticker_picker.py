@@ -485,7 +485,6 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
    # print(f"[DEBUG GEOM] deco {deco_w}x{deco_h} | setting geometry {w}x{h}+{x}+{y}")
     root.geometry(f"{w}x{h}+{x}+{y}")
     root.update_idletasks()
-   # print(f"[DEBUG GEOM] actual root size: {root.winfo_width()}x{root.winfo_height()} at ({root.winfo_x()},{root.winfo_y()})")
     root.minsize(500, 400)
 
     mono      = tkfont.Font(family="Consolas", size=app_settings.scaled_size(MONO_FONT_SIZE, _picker_scale))
@@ -1966,23 +1965,23 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     # checkbox itself off-window (no way to find it again to switch back off).
     # Pulled into its own full-width row, with the quarterly controls always
     # present (dimmed, not hidden) so nothing can crowd anything else off-screen.
-    history_frame = tk.Frame(root, bg=CLR_BG, pady=8, padx=14,
+    # "Annual:"/"yrs" and "Also show quarterly:" already say what this row
+    # is, so the standalone "History" heading was redundant — dropped, and
+    # the frame's vertical padding tightened now that it's back to one row.
+    history_frame = tk.Frame(root, bg=CLR_BG, pady=4, padx=14,
                               highlightthickness=1, highlightbackground="#DCE3EC")
     history_frame.pack(side="bottom", fill="x")
 
-    tk.Label(history_frame, text="History", bg=CLR_BG, fg=CLR_SUBTEXT,
-             font=bold).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
-
     tk.Label(history_frame, text="Annual:", bg=CLR_BG,
-             fg=CLR_TEXT, font=bold).grid(row=1, column=0, sticky="w", padx=(0, 6))
+             fg=CLR_TEXT, font=bold).grid(row=0, column=0, sticky="w", padx=(0, 6))
     years_var = tk.StringVar(value=str(_years_default))
     _dialog_state["years_var"] = years_var
     tk.Entry(history_frame, textvariable=years_var, font=mono,
              width=4, relief="flat", highlightthickness=1,
              highlightcolor=CLR_ACCENT,
-             highlightbackground="#CCCCCC").grid(row=1, column=1, sticky="w")
+             highlightbackground="#CCCCCC").grid(row=0, column=1, sticky="w")
     tk.Label(history_frame, text="yrs", bg=CLR_BG,
-             fg=CLR_SUBTEXT, font=mono).grid(row=1, column=2, sticky="w", padx=(4, 0))
+             fg=CLR_SUBTEXT, font=mono).grid(row=0, column=2, sticky="w", padx=(4, 0))
 
     quarterly_var = tk.BooleanVar(value=False)
     q_mode_var    = tk.StringVar(value="last_n")
@@ -1994,7 +1993,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     _q_linked     = {"on": True}   # False once the user hand-edits the qtrs box
 
     q_check_container = tk.Frame(history_frame, bg=CLR_BG)
-    q_check_container.grid(row=1, column=3, sticky="w", padx=(20, 0))
+    q_check_container.grid(row=0, column=3, sticky="w", padx=(20, 0))
     q_check_btn = tk.Button(q_check_container,
                              text="☑" if quarterly_var.get() else "☐",
                              font=tick_font,
@@ -2014,7 +2013,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     q_check_btn.config(command=_toggle_quarterly)
 
     q_controls = tk.Frame(history_frame, bg=CLR_BG)
-    q_controls.grid(row=1, column=4, columnspan=2, sticky="w", padx=(10, 0))
+    q_controls.grid(row=0, column=4, columnspan=2, sticky="w", padx=(10, 0))
 
     q_last_n_row = tk.Frame(q_controls, bg=CLR_BG)
     q_range_row  = tk.Frame(q_controls, bg=CLR_BG)
@@ -2193,6 +2192,21 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     _make_toggle_btn(ctrl, "Re-download",  refresh_var,     side="right", padx=(0, 8))
     _make_toggle_btn(ctrl, "Export files", export_var,      side="right", padx=(0, 8))
 
+    # ── Re-prioritize layout: protect ctrl & history_frame, let list_outer flex ──
+    # Debug run confirmed this isn't a window-too-small problem (945px was
+    # already more than the 804px the old height-fit math called for) — it's
+    # a pack-PRIORITY problem. Tk's packer hands each slave its full
+    # reqheight in pack-call order; whichever slave is packed LAST gets
+    # whatever's left over, shortfall and all. list_outer was packed before
+    # ctrl/history_frame, so at larger font scales Tk was quietly giving
+    # list_outer its full natural height and dumping the entire deficit on
+    # history_frame (packed last), clipping its second grid row. list_outer
+    # is the one row that's actually fine to shrink — it scrolls. Re-pack it
+    # last so the packer reserves ctrl & history_frame's full height first
+    # and only gives list_outer whatever's left.
+    list_outer.pack_forget()
+    list_outer.pack(fill="both", expand=True)
+
     # ── Fit window width to actual content ─────────────────────────────────
     # WINDOW_WIDTH (1600) is only a starting guess. The bottom control bar
     # (Select All / Clear All / Export files / Re-download / Show charts / Go),
@@ -2210,7 +2224,30 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     _margin = 40
     _desired_w = _content_w + _margin
     _final_w = max(500, min(_desired_w, work_w - deco_w * 2))
-    root.geometry(f"{_final_w}x{root.winfo_height()}+{root.winfo_x()}+{root.winfo_y()}")
+
+    # ── Fit window height to actual content (secondary safety net) ─────────
+    # The real bug was the pack-order issue fixed above. This block is a
+    # backstop for extreme font scales where even the fixed rows alone
+    # (hdr+wl_frame+summary_frame+toggle_frame+search_frame+ctrl+
+    # history_frame) might outgrow the window with nothing left for
+    # list_outer at all. Grow the window to cover the fixed rows plus a
+    # small floor for the ticker list — clamped to the screen.
+    _fixed_h = (
+        hdr.winfo_reqheight()
+        + wl_frame.winfo_reqheight()
+        + summary_frame.winfo_reqheight()
+        + toggle_frame.winfo_reqheight()
+        + search_frame.winfo_reqheight()
+        + ctrl.winfo_reqheight()
+        + history_frame.winfo_reqheight()
+    )
+    _min_list_h = 120  # just enough for a couple of ticker rows to stay visible
+    _desired_h = _fixed_h + _min_list_h
+    _final_h = max(root.winfo_height(), min(_desired_h, work_h - deco_h))
+
+    root.geometry(f"{_final_w}x{_final_h}+{root.winfo_x()}+{root.winfo_y()}")
+    root.minsize(500, _fixed_h + 100)
+    root.update_idletasks()
 
     # ── Status panel (hidden until Go is pressed) ─────────────────────────
     status_panel = tk.Frame(root, bg=CLR_BG)
@@ -2289,9 +2326,9 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         summary_frame.pack(fill="x")
         toggle_frame.pack(fill="x")
         search_frame.pack(fill="x")
-        list_outer.pack(fill="both", expand=True)
         ctrl.pack(side="bottom", fill="x")
         history_frame.pack(side="bottom", fill="x")
+        list_outer.pack(fill="both", expand=True)
         root.geometry(_saved_geo)
         root.update_idletasks()
         # Re-enter mainloop on the SAME window so user can pick again.
