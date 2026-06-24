@@ -1117,6 +1117,37 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
         lbl.bind("<Button-1>", lambda e, v=val: _set_filter(v))
         _filter_btns[val] = (btn, lbl)
 
+    # ── Show Charts / Show Tables toggles (right side of toggle_frame) ────
+    tk.Frame(toggle_frame, bg="#CCCCCC", width=1).pack(side="left", fill="y", padx=(8, 16))
+
+    show_charts_var = tk.BooleanVar(value=True)
+    show_tables_var = tk.BooleanVar(value=True)
+
+    def _make_view_toggle(parent, label, var):
+        container = tk.Frame(parent, bg=CLR_BG)
+        container.pack(side="left", padx=(0, 16))
+        btn = tk.Button(container,
+                        text="☑" if var.get() else "☐",
+                        font=tick_font,
+                        fg=CLR_ACCENT if var.get() else "#AAAAAA",
+                        bg=CLR_BG, activebackground=CLR_BG,
+                        relief="flat", bd=0, cursor="hand2", padx=0, pady=0)
+        btn.pack(side="left")
+        lbl = tk.Label(container, text=label, bg=CLR_BG, fg=CLR_TEXT, font=bold)
+        lbl.pack(side="left")
+
+        def _toggle():
+            var.set(not var.get())
+            btn.config(text="☑" if var.get() else "☐",
+                       fg=CLR_ACCENT if var.get() else "#AAAAAA")
+
+        btn.config(command=_toggle)
+        lbl.bind("<Button-1>", lambda e: _toggle())
+        return btn
+
+    _show_charts_toggle = _make_view_toggle(toggle_frame, "Show charts", show_charts_var)
+    _show_tables_toggle = _make_view_toggle(toggle_frame, "Show tables", show_tables_var)
+
     # ── Search bar ────────────────────────────────────────────────────────
     search_frame = tk.Frame(root, bg=CLR_BG, pady=8, padx=14)
     search_frame.pack(fill="x")
@@ -2119,7 +2150,6 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
 
     refresh_var     = tk.BooleanVar(value=False)
     export_var      = tk.BooleanVar(value=False)
-    show_charts_var = tk.BooleanVar(value=True)
 
     def _go():
         nonlocal result_tickers, result_years, result_refresh, result_export
@@ -2153,6 +2183,7 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
             _run_state["force_refresh"] = result_refresh
             _run_state["do_export"]     = result_export
             _run_state["show_charts"]   = show_charts_var.get()
+            _run_state["show_tables"]   = show_tables_var.get()
             _run_state["show_quarterly"] = quarterly_var.get()
             _run_state["quarterly_mode"] = q_mode_var.get()
             try:
@@ -2188,7 +2219,6 @@ def pick_tickers(db_path: str, _run_state: dict = None, prefs_callback=None) -> 
     tk.Button(ctrl, text="▶  Go", bg=CLR_ACCENT, fg=CLR_BTN_FG,
               activebackground="#0082C8",
               command=_go, **btn_cfg).pack(side="right")
-    _make_toggle_btn(ctrl, "Show charts",  show_charts_var, side="right", padx=(0, 8))
     _make_toggle_btn(ctrl, "Re-download",  refresh_var,     side="right", padx=(0, 8))
     _make_toggle_btn(ctrl, "Export files", export_var,      side="right", padx=(0, 8))
 

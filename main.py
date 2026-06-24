@@ -3033,6 +3033,7 @@ def main():
         "force_refresh": False,
         "do_export":     False,
         "show_charts":   True,
+        "show_tables":   True,
         "show_quarterly": False,
         "quarterly_mode": "last_n",
         "quarters_back":  8,
@@ -3058,7 +3059,15 @@ def main():
                     return
             except Exception:
                 return
-
+        # ADD THESE — re-read every iteration just like show_quarterly etc.
+        selected = _run_state["selected"]
+        YEARS_BACK = _run_state["years_back"]
+        force_refresh = _run_state["force_refresh"]
+        do_export = _run_state["do_export"]
+        do_show = _run_state.get("show_charts", True)
+        do_tables = _run_state.get("show_tables", True)
+        print(f"[loop top] do_show={do_show} do_export={do_export}")
+        show_quarterly = _run_state.get("show_quarterly", False)
         # Re-bind log to the current window widgets each iteration
         _cur_log, _cur_title = _log, _title_var
 
@@ -3179,8 +3188,7 @@ def main():
         all_loaded = [d['symbol'] for d in stock_list] + [d['symbol'] for d in etf_list]
         log(f"\nLoaded: {', '.join(all_loaded)}", title="Building charts\u2026")
 
-        do_show       = _run_state.get("show_charts", True)
-        need_charts   = do_show or do_export
+        need_charts = do_show or do_tables or do_export
 
         apply_style()
         chart_prefs        = load_chart_prefs()
@@ -3215,13 +3223,13 @@ def main():
                     else:
                         log(f"  \u2014 {d['symbol']}  no quarterly data to chart")
 
-            if stock_list:
+            if stock_list and do_tables:
                 log("  Table: Scorecard — Growth & Quality")
                 show_stock_table_growth(stock_list, stock_colors, YEARS_BACK)
                 log("  Table: Scorecard — Valuation, Balance Sheet & Capital Return")
                 show_stock_table_valuation(stock_list, stock_colors, YEARS_BACK)
 
-            if show_quarterly and quarterly_table_data:
+            if show_quarterly and quarterly_table_data and do_tables:
                 log("  Table: Quarterly Scorecard — Earnings Quality")
                 show_stock_table_quarterly_earnings(quarterly_table_data, stock_colors)
                 log("  Table: Quarterly Scorecard — Cash, Capital Intensity & Valuation")
@@ -3239,8 +3247,9 @@ def main():
                 log("  Chart: ETF Overview")
                 fig_etf = plot_etf(etf_list, etf_colors, YEARS_BACK)
                 fig_etf.canvas.manager.set_window_title("ETF Overview")
-                log("  Table: ETF Scorecard")
-                show_etf_table(etf_list, etf_colors, YEARS_BACK)
+                if do_tables:
+                    log("  Table: ETF Scorecard")
+                    show_etf_table(etf_list, etf_colors, YEARS_BACK)
 
         figs = figs_stock_single[:] + figs_quarterly
         for f in [fig_growth_table, fig_valuation_table, fig_comparison,
@@ -3284,14 +3293,7 @@ def main():
         except Exception:
             pass
 
-        if not _run_state["selected"]:
-            print("No tickers selected. Exiting.")
-            sys.exit(0)
-        selected      = _run_state["selected"]
-        YEARS_BACK    = _run_state["years_back"]
-        force_refresh = _run_state["force_refresh"]
-        do_export     = _run_state["do_export"]
-        do_show       = _run_state.get("show_charts", True)
+
 
 
 def is_stale(conn, symbol, years_back, days=90):
